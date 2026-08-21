@@ -1,0 +1,15 @@
+{
+  "name": "aimp-ncm-service",
+  "version": "1.0.0",
+  "description": "AIMP NCM 镜像服务 - 封装 NeteaseCloudMusicApi",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "NeteaseCloudMusicApi": "^4.0.0",
+    "express": "^4.18.2",
+    "cookie-parser": "^1.4.6"
+  }
+}

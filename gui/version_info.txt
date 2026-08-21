@@ -1,0 +1,28 @@
+# UTF-8
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 2, 0, 0),
+    prodvers=(1, 2, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable('080404b0', [
+        StringStruct('CompanyName', 'AIMP NCM Project'),
+        StringStruct('FileDescription', 'AIMP NCM 网易云串流 GUI 控制中心'),
+        StringStruct('FileVersion', '1.2.0.0'),
+        StringStruct('InternalName', 'AIMP_NCM_GUI'),
+        StringStruct('LegalCopyright', 'MIT License'),
+        StringStruct('OriginalFilename', 'AIMP_NCM_GUI.exe'),
+        StringStruct('ProductName', 'AIMP NCM GUI'),
+        StringStruct('ProductVersion', '1.2.0.0')
+      ])
+    ]),
+    VarFileInfo([VarStruct('Translation', [2052, 1200])])
+  ]
+)

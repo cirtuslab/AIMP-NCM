@@ -1,0 +1,22 @@
+# 构建产物
+build/
+build_x86/
+build_gui/
+dist_gui/
+dist_final/
+release/
+dist/
+!dist/install.ps1
+!dist/README_INSTALL.txt
+
+# IDE / 系统
+*.user
+*.suo
+.vs/
+.vscode/
+__pycache__/
+node_modules/
+*.log
+.DS_Store
+
+# 第三方单头库体积较大但为编译必需, 纳入版本管理(见 plugin/third_party/nlohmann/)
