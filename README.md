@@ -103,6 +103,22 @@ cd ncm_service && npm install && node server.js     # Node: 基于 NeteaseCloudM
 - **应用按钮灰的？** 先「刷新歌单」，勾选后按钮点亮
 - **杀软报 GUI EXE？** PyInstaller 通病，用 onedir 模式产物或加白名单
 
+## 参考的开源项目
+
+本项目的协议实现与 AIMP 集成方式大量借鉴了以下开源项目，特此致谢：
+
+| 项目 | 主要参考点 |
+|------|-----------|
+| [Binaryify/NeteaseCloudMusicApi](https://github.com/Binaryify/NeteaseCloudMusicApi) | Node 镜像服务基础；weapi/eapi 接口行为基准 |
+| [NeteaseCloudMusicApiEnhanced/api-enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced) | 扫码登录新协议（`type=3` + `chainId`）与滑块风控对策 |
+| [go-musicfox/go-musicfox](https://github.com/go-musicfox/go-musicfox) | 设备指纹 Cookie（`sDeviceId`/`_ntes_nuid` 等）与 eapi 歌曲链接参数构造 |
+| [chaunsin/netease-cloud-music](https://github.com/chaunsin/netease-cloud-music) | 网易云协议逆向研究资料（eapi 加密细节） |
+| [AdrianEddy/AIMPYouTube](https://github.com/AdrianEddy/AIMPYouTube) | AIMP 文件系统扩展注册方式与虚拟流播放模式 |
+| [cirtuslab/aimp_desktop_lyrics](https://github.com/cirtuslab/aimp_desktop_lyrics) | AIMP 原生选项页控件布局范式；插件目录权限免 UAC 处理 |
+| [cirtuslab/AIMPLyricsSaver](https://github.com/cirtuslab/AIMPLyricsSaver) | WinHTTP + RapidJSON 的 C++ 插件实现范式 |
+| [imsyy/SPlayer](https://github.com/imsyy/SPlayer) | 「官方网页登录 → 读取 Cookie」的免风控登录流程 |
+| [martin211/aimp_dotnet](https://github.com/martin211/aimp_dotnet) | AIMP 各扩展类别注册 IID 映射的权威佐证 |
+
 ## 许可
 
 MIT。第三方：AIMP SDK © Artem Izmaylov，nlohmann/json MIT，NeteaseCloudMusicApi MIT。
