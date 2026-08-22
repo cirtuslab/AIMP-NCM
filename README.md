@@ -1,9 +1,11 @@
-# AIMP NCM - 网易云音乐串流插件
+# AIMP NCM · 网易云音乐串流插件
 
-> **AIMPack 插件**（AIMP 5.40，x86 + x64）：在 AIMP 中直接搜索/播放你的网易云音乐歌单。
-> 支持扫码登录、官方网页 Cookie 导入、音质切换、歌单一键同步。GUI 仅作为测试/调试辅助工具。
+> **AIMPack 插件**（AIMP 5.40+，x86 + x64）：在 AIMP 中直接播放你的网易云音乐歌单。
+> 支持扫码 / 网页 Cookie 登录、音质切换、歌单一键同步，播放时显示完整歌曲信息（标题 / 歌手 / 专辑 / 封面）。
 
-## 功能（插件本体）
+![GitHub Release](https://img.shields.io/github/v/release/cirtuslab/AIMP-NCM)
+
+## 功能特性
 
 - **原生设置页**：集成在 `设置 → 插件 → 网易云串流`，跟随 AIMP 皮肤
 - **登录三通道**：
@@ -11,16 +13,19 @@
   2. 📱 **扫码登录**——新协议（`type=3` + `chainId`）；若命中滑块验证会自动用浏览器打开验证页，完成后自动继续
   3. 📋 **Cookie 直填**——只粘裸值也可以（自动补 `MUSIC_U=` 键名）
 - **歌单同步**：勾选歌单 → 点「应用」→ 自动创建/刷新播放列表「网易云串流」，勾选状态持久化
-- **本地代理播放**：内嵌 `http://127.0.0.1:{port}` 重定向服务（默认 47777，占用自动后移），播放时实时解析真实 CDN 链接并 302 跳转——**链接不过期、无需预取**
+- **完整歌曲信息**：播放时本地代理向音频流注入 ID3v2 标签（标题 / 歌手 / 专辑 / 时长 / 封面），AIMP 播放器与封面面板直接显示；封面按播放即时下载并磁盘缓存，**无批量请求**
+- **本地代理播放**：内嵌 `http://127.0.0.1:{port}` 服务（默认 47777，占用自动后移），实时解析真实 CDN 链接并代理拉流，支持磁盘缓存与 Range/seek——链接不过期、无需预取
 - **音质**：`standard / higher / exhigh / lossless / hires / jymaster / jyeffect / sky`，实时生效（高音质需会员，否则自动降级）
 - 直连国内可用；海外/受限网络可启用代理镜像
 
 ## 安装
 
+从 [Releases](https://github.com/cirtuslab/AIMP-NCM/releases/latest) 下载 `aimp_ncm.aimppack`：
+
 ```powershell
-# 方式一：双击 dist/aimp_ncm.aimppack（可能弹 UAC）
+# 方式一：双击 aimp_ncm.aimppack（可能弹 UAC）
 # 方式二：静默安装
-powershell -ExecutionPolicy Bypass -File dist/install.ps1
+powershell -ExecutionPolicy Bypass -File install.ps1
 # 免 UAC（管理员运行一次即可）
 powershell -ExecutionPolicy Bypass -File tools/fix_aimp_plugin_perm.ps1
 ```
@@ -61,8 +66,11 @@ powershell -ExecutionPolicy Bypass -File build.ps1   # 生成 dist/aimp_ncm.aimp
 
 ```
 AIMP 播放 http://127.0.0.1:{port}/{pid}/{tid}.mp3
-        └─► 插件内嵌服务: eapi/weapi 实时解析真实链接 ──► 302 ──► 网易云 CDN ──► 播放
-             （Cookie 来自 config.json，每次播放重新取链，不存在过期问题）
+        └─► 插件内嵌 LocalServer: eapi/weapi 实时解析真实 CDN 链接
+             ├─► 缓存命中 → 直接回本地缓存文件（支持 Range）
+             └─► 未命中 → 代理拉流并落盘缓存
+             响应前置 ID3v2 标签(标题/歌手/专辑/时长/封面)
+                  └─► AIMP 解码器解析标签 → 播放器显示歌曲信息与封面
 
 设置页 ──► weapi/eapi 直连 music.163.com 或 镜像 http://{apiUrl}
 登录   ──► 扫码: /weapi/login/qrcode/* (+chainId 防风控)
@@ -76,7 +84,7 @@ AIMP 播放 http://127.0.0.1:{port}/{pid}/{tid}.mp3
 - 三种登录方式测试（扫码 / 从浏览器导入 / 粘贴 Cookie），日志可视化
 - 镜像连通性测试、直连 weapi 自检
 - 歌单拉取、批量预取真实链接生成 m3u8（不依赖插件的备用方案）
-- 与插件共用同一份 config.json，改完即生效
+- 与插件共用同一份 config.json 与歌曲元数据缓存，改完即生效
 
 ```bash
 pip install -r gui/requirements.txt
@@ -96,7 +104,7 @@ cd ncm_service && npm install && node server.js     # Node: 基于 NeteaseCloudM
 
 ## 常见问题
 
-- **播放报 Unsupported protocol？** 使用 v1.3+ 版本（已改用本地 http 重定向方案），重新点一次「应用」刷新播放列表
+- **播放器不显示歌曲信息/封面？** 重新点一次「应用」同步歌单（元数据在同步时写入本地缓存）；封面在首次播放该曲时即时下载，失败会自动跳过、不影响播放
 - **灰色/404？** 会员音质或版权限制，插件自动降级到 exhigh
 - **境外 460/403？** 启用代理并填国内 VPS 镜像
 - **扫码提示环境异常/滑块？** 会自动打开验证页，完成后继续；或改用官方网页 Cookie 方式（推荐）
@@ -116,6 +124,7 @@ cd ncm_service && npm install && node server.js     # Node: 基于 NeteaseCloudM
 | [AdrianEddy/AIMPYouTube](https://github.com/AdrianEddy/AIMPYouTube) | AIMP 文件系统扩展注册方式与虚拟流播放模式 |
 | [cirtuslab/aimp_desktop_lyrics](https://github.com/cirtuslab/aimp_desktop_lyrics) | AIMP 原生选项页控件布局范式；插件目录权限免 UAC 处理 |
 | [cirtuslab/AIMPLyricsSaver](https://github.com/cirtuslab/AIMPLyricsSaver) | WinHTTP + RapidJSON 的 C++ 插件实现范式 |
+| [cirtuslab/SongMetaFixer](https://github.com/cirtuslab/SongMetaFixer) | 歌曲元数据字段集与网易云详情接口数据源 |
 | [imsyy/SPlayer](https://github.com/imsyy/SPlayer) | 「官方网页登录 → 读取 Cookie」的免风控登录流程 |
 | [martin211/aimp_dotnet](https://github.com/martin211/aimp_dotnet) | AIMP 各扩展类别注册 IID 映射的权威佐证 |
 
@@ -130,7 +139,7 @@ MIT。第三方：AIMP SDK © Artem Izmaylov，nlohmann/json MIT，NeteaseCloudM
 1. **本项目仅供个人学习与研究**，请勿用于任何商业用途。
 2. 通过非官方接口访问网易云音乐服务**可能违反《网易云音乐用户协议》**，由此导致的账号风控、限流、封禁等后果由使用者自行承担。
 3. 登录凭据（MUSIC_U Cookie 等）以**明文**保存在本地 `%APPDATA%\AIMP\NcmPlugin\config.json` 中，请妥善保管，切勿分享给他人或上传至公开场合；Cookie 泄露等同账号泄露。
-4. 插件会在本机回环地址（127.0.0.1）开启一个 HTTP 端口用于播放重定向，仅本机可访问；请勿将其暴露到公网。
+4. 插件会在本机回环地址（127.0.0.1）开启一个 HTTP 端口用于播放代理，仅本机可访问；请勿将其暴露到公网。
 5. 网易云音乐接口随时可能变更导致本项目部分或全部功能失效，作者不承诺持续维护。
 6. 本项目与网易云音乐（网易公司）官方**无任何关联**，不代表官方立场；相关版权归原权利人所有。
 7. **下载、安装或使用本软件即表示您已阅读并理解上述风险，并自愿承担全部责任。** 如不同意，请立即停止使用并卸载。
