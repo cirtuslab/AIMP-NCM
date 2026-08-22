@@ -3,6 +3,7 @@
 #include "config.h"
 #include "filesystem.h"
 #include "local_server.h"
+#include "artwork_provider.h"
 #include "ncm_options_frame.h"
 
 AimpNcmPlugin::AimpNcmPlugin(){}
@@ -62,6 +63,11 @@ HRESULT AimpNcmPlugin::Initialize(IAIMPCore* Core){
     } catch(...){}
     // 注册设置对话框（旧入口保留）
     core_->RegisterExtension(IID_IAIMPExternalSettingsDialog, static_cast<IAIMPExternalSettingsDialog*>(this));
+    // 注册封面提供者: 为本地代理条目提供网易云歌曲封面
+    try {
+        art_ = new NcmArtworkProvider(core_);
+        core_->RegisterExtension(IID_IAIMPServiceAlbumArt, static_cast<IAIMPExtensionAlbumArtProvider2*>(art_));
+    } catch(...){ art_=nullptr; }
     // 注册选项页 (新 SDK 原生) - 集成到 设置->插件 左树
     // 同样: 不 Release，由插件持有至 Finalize()
     try {
@@ -87,6 +93,11 @@ HRESULT AimpNcmPlugin::Finalize(){
             core_->UnregisterExtension(static_cast<IAIMPExtensionFileInfoProvider*>(fs_));
             fs_->Release();
             fs_=nullptr;
+        }
+        if(art_){
+            core_->UnregisterExtension(static_cast<IAIMPExtensionAlbumArtProvider2*>(art_));
+            art_->Release();
+            art_=nullptr;
         }
         core_=nullptr;
     }
