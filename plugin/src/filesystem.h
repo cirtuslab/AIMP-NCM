@@ -1,9 +1,11 @@
 #pragma once
 #include <string>
+#include <vector>
 #include <windows.h>
 #include "../third_party/aimp_sdk/apiFileManager.h"
 #include "../third_party/aimp_sdk/apiObjects.h"
 #include "../third_party/aimp_sdk/apiCore.h"
+#include "ncm_client.h"
 
 // 完整 ncm:// 虚拟文件系统，支持懒加载播放
 // 注意: 播放取流走 IAIMPFileSystemCommandDropSource::CreateStream(2参数版),
@@ -45,6 +47,8 @@ public:
     // SCHEME 返回裸协议名(参考 AIMPYouTube: "youtube"), AIMP 自行匹配 ncm:// URI
     static const wchar_t* Scheme() { return L"ncm"; }
     static bool Parse(const std::wstring& uri, long long& pid, long long& tid);
+    // 统一解析串流条目 URI: ncm://pid/tid(.mp3) 或 http://127.0.0.1:{port}/{pid}/{tid}.{ext}
+    static bool ParseStreamUri(const std::wstring& uri, long long& pid, long long& tid);
     static std::wstring MakeUri(long long pid, long long tid);
 
     // Helper for m3u generation (fallback when FileSystem not registered)

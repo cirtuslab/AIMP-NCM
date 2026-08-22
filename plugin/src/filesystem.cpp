@@ -1,7 +1,7 @@
 #include "filesystem.h"
 #include "utils.h"
 #include "config.h"
-#include "ncm_client.h"
+#include "meta_cache.h"
 #include "../third_party/aimp_sdk/apiFileManager.h"
 #include <shlwapi.h>
 #include <fstream>
@@ -22,14 +22,6 @@ void FsLog(const char* what){
 void FsLogUri(const char* what, IAIMPString* s){
     std::wstring w = s ? AimpStringToWString(s) : L"(null)";
     FsLog((std::string(what) + " uri=" + WideToUtf8(w)).c_str());
-}
-static void FsLogGuid(const char* what, REFIID riid){
-    char b[128]; LPOLESTR w=nullptr;
-    if(SUCCEEDED(StringFromIID(riid, &w))){
-        sprintf_s(b, "%s iid=%ls", what, w);
-        CoTaskMemFree(w);
-    } else sprintf_s(b, "%s iid=<?>", what);
-    FsLog(b);
 }
 
 NcmFileSystem::NcmFileSystem(IAIMPCore* core): core_(core) {
@@ -157,20 +149,85 @@ HRESULT NcmFileSystem::IsFileExists(IAIMPString* FileName){
 HRESULT NcmFileSystem::GetFileInfo(IAIMPString* FileURI, IAIMPFileInfo* Info){
     if(!Info) return E_POINTER;
     FsLogUri("GetFileInfo called", FileURI);
-    if(!IsNcmUri(FileURI)) return E_FAIL;
     std::wstring w = AimpStringToWString(FileURI);
     long long pid=0,tid=0;
-    if(!Parse(w,pid,tid)) return S_OK;
-    // 避免在 FileInfo 线程做网络请求，直接用 URI 解析标题，异步获取详情由后台缓存
+    if(!ParseStreamUri(w, pid, tid)) return E_FAIL;   // 非本插件条目 -> 交由其他 provider
+
+    // 元数据与封面统一由 NcmMeta 提供(缓存优先, 未命中同步拉取并回写)
+    NcmSong song;
+    bool haveInfo = NcmMeta::Lookup(pid, tid, song);
+    if(!haveInfo){
+        NcmConfig cfg; ConfigManager::Load(cfg);
+        NcmClient client(cfg);
+        if(client.GetSongDetail(tid, song) && !song.title.empty()){
+            NcmMeta::Upsert(pid, song);
+            haveInfo = true;
+        }
+    }
+
     IAIMPString *s=nullptr;
     core_->CreateObject(IID_IAIMPString,(void**)&s);
     if(s){
-        std::wstring t = L"NCM " + std::to_wstring(tid);
+        std::wstring t = (haveInfo && !song.title.empty()) ? song.title
+                         : (L"NCM " + std::to_wstring(tid));
         s->SetData((TChar*)t.c_str(), (int)t.size());
         Info->SetValueAsObject(AIMP_FILEINFO_PROPID_TITLE, s);
         s->Release();
     }
+    if(haveInfo){
+        if(!song.artist.empty()){
+            IAIMPString* v = WStringToAimpString(core_, song.artist);
+            if(v){ Info->SetValueAsObject(AIMP_FILEINFO_PROPID_ARTIST, v); v->Release(); }
+        }
+        if(!song.album.empty()){
+            IAIMPString* v = WStringToAimpString(core_, song.album);
+            if(v){ Info->SetValueAsObject(AIMP_FILEINFO_PROPID_ALBUM, v); v->Release(); }
+        }
+        if(song.durationMs > 0)
+            Info->SetValueAsFloat(AIMP_FILEINFO_PROPID_DURATION, song.durationMs / 1000.0);
+        // 封面作为 ALBUMART 属性附带(磁盘缓存/下载由 NcmMeta::GetCoverBytes 处理)
+        std::string bytes;
+        if(NcmMeta::GetCoverBytes(tid, song.coverUrl, bytes) && !bytes.empty()){
+            IAIMPImageContainer* img = nullptr;
+            if(SUCCEEDED(core_->CreateObject(IID_IAIMPImageContainer, (void**)&img)) && img){
+                img->SetDataSize((LongWord)bytes.size());
+                memcpy(img->GetData(), bytes.data(), bytes.size());
+                Info->SetValueAsObject(AIMP_FILEINFO_PROPID_ALBUMART, img);
+                img->Release();
+            }
+        }
+    }
+
     // FileName 保持原 URI
     Info->SetValueAsObject(AIMP_FILEINFO_PROPID_FILENAME, FileURI);
     return S_OK;
+}
+
+bool NcmFileSystem::ParseStreamUri(const std::wstring& uri, long long& pid, long long& tid){
+    if(uri.rfind(L"ncm://", 0) == 0){
+        std::wstring rest = uri.substr(6);
+        size_t slash = rest.find(L'/');
+        if(slash == std::wstring::npos) return false;
+        std::wstring tidStr = rest.substr(slash + 1);
+        size_t dot = tidStr.find(L'.');
+        if(dot != std::wstring::npos) tidStr = tidStr.substr(0, dot);
+        try{ pid = std::stoll(rest.substr(0, slash)); tid = std::stoll(tidStr); return tid > 0; }
+        catch(...){ return false; }
+    }
+    // http://127.0.0.1:{port}/{pid}/{tid}.{ext} (仅环回主机)
+    size_t scheme = uri.find(L"://");
+    if(scheme == std::wstring::npos) return false;
+    size_t hostEnd = uri.find(L'/', scheme + 3);
+    if(hostEnd == std::wstring::npos) return false;
+    if(uri.compare(scheme + 3, 9, L"127.0.0.1") != 0) return false;
+    size_t slash2 = uri.find(L'/', hostEnd + 1);
+    if(slash2 == std::wstring::npos) return false;
+    std::wstring tidStr = uri.substr(slash2 + 1);
+    size_t dot = tidStr.find(L'.');
+    if(dot != std::wstring::npos) tidStr = tidStr.substr(0, dot);
+    try{
+        pid = std::stoll(uri.substr(hostEnd + 1, slash2 - hostEnd - 1));
+        tid = std::stoll(tidStr);
+        return pid > 0 && tid > 0;
+    }catch(...){ return false; }
 }

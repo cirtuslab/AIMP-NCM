@@ -26,5 +26,4 @@ private:
     IAIMPCore* core_=nullptr;
     class NcmFileSystem* fs_ = nullptr;
     class NcmOptionsFrame* optionsFrame_ = nullptr;
-    class NcmArtworkProvider* art_ = nullptr;
 };

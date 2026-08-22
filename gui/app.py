@@ -1260,6 +1260,25 @@ class NCMGui:
                 self._log("未获取到任何歌曲")
                 return
 
+            # 写歌曲元数据缓存 (与插件 FileInfoProvider 共用 %TEMP%\aimp_ncm\song_meta.json,
+            # 供 AIMP 显示标题/歌手/专辑/时长/封面; 插件按文件修改时间自动重载)
+            try:
+                meta = {}
+                for pid, s in all_songs:
+                    al = s.get("al") or {}
+                    meta.setdefault(str(pid), {})[str(s["id"])] = {
+                        "title": s.get("name", ""),
+                        "artist": "/".join([a["name"] for a in s.get("ar", []) if "name" in a]),
+                        "album": al.get("name", ""),
+                        "durationMs": s.get("dt", 0),
+                        "coverUrl": al.get("picUrl", ""),
+                    }
+                meta_path = os.path.join(tmpdir, "song_meta.json")
+                with open(meta_path, "w", encoding="utf-8") as mf:
+                    json.dump(meta, mf, ensure_ascii=False)
+            except Exception as e:
+                self._log(f"写入歌曲元数据缓存失败: {e}")
+
             self._log(f"共 {len(all_songs)} 首，{'懒加载' if use_lazy else '批量获取链接'}...")
             with open(merged_m3u, "w", encoding="utf-8") as f:
                 f.write("#EXTM3U\n")

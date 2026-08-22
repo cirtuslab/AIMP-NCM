@@ -5,6 +5,8 @@
 #include "http_client.h"
 #include "ncm_login_form.h"
 #include "local_server.h"
+#include "filesystem.h"
+#include "meta_cache.h"
 #include "../third_party/aimp_sdk/apiGUI.h"
 #include "../third_party/aimp_sdk/apiOptions.h"
 #include "../third_party/aimp_sdk/apiObjects.h"
@@ -501,6 +503,8 @@ void NcmOptionsFrame::StartSync(){
             PostMessageW(hNotif, WM_USER+2, 0, (LPARAM)prog);
             std::vector<NcmSong> songs; NcmPlaylist info;
             if(!client.GetPlaylistDetail(pid, songs, &info) || songs.empty()){ failed++; continue; }
+            // 写入歌曲元数据缓存(供本地代理注入流标签: 标题/歌手/专辑/时长/封面)
+            NcmMeta::WritePlaylist(pid, songs);
             for(auto& s : songs){
                 f << "#EXTINF:" << (s.durationMs/1000) << "," << WideToUtf8(s.artist) << " - " << WideToUtf8(s.title) << "\n";
                 f << base << pid << "/" << s.id << ".mp3\n";
@@ -508,6 +512,7 @@ void NcmOptionsFrame::StartSync(){
             }
         }
         f.close();
+        // 封面不批量预取: 播放到某首歌时才由本地代理即时下载并缓存
         if(total==0){
             wchar_t b[128];
             swprintf_s(b, L"未获取到歌曲(失败 %d 个歌单) · 请检查登录状态/网络后重试", failed);

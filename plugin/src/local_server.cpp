@@ -5,6 +5,7 @@
 #include "config.h"
 #include "ncm_client.h"
 #include "utils.h"
+#include "meta_cache.h"
 #include <winhttp.h>
 #include <atomic>
 #include <thread>
@@ -103,30 +104,42 @@ bool SendAll(SOCKET s, const std::string& data){ return SendAll(s, data.c_str(),
 
 long long ParseRangeStart(const std::string& req);
 
-// serve a local file directly (supports Range); returns whether handled
-bool ServeFile(SOCKET s, const std::wstring& path, const std::wstring& ext, long long rangeStart){
+// serve a local file directly (supports Range); returns whether handled.
+// tag: 可选 ID3v2 前缀标签, 使虚拟流 = tag + 音频(客户端偏移需减去 tagSize 映射到文件)
+bool ServeFile(SOCKET s, const std::wstring& path, const std::wstring& ext, long long reqStart, const std::string* tag){
     HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if(f == INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER li;
     if(!GetFileSizeEx(f, &li)){ CloseHandle(f); return false; }
-    long long size = li.QuadPart;
-    if(rangeStart >= size){ CloseHandle(f); return false; } // invalid range -> treat as miss
-    bool partial = rangeStart > 0;
+    long long tagSize = tag ? (long long)tag->size() : 0;
+    long long size = li.QuadPart + tagSize;              // 虚拟流总长 = 标签 + 原音频
+    if(reqStart >= size){ CloseHandle(f); return false; } // invalid range -> treat as miss
+    bool partial = reqStart > 0;
+    long long sendLen = size - reqStart;
 
     std::string head = partial
         ? "HTTP/1.1 206 Partial Content\r\n"
-          "Content-Range: bytes " + std::to_string(rangeStart) + "-" + std::to_string(size-1) + "/" + std::to_string(size) + "\r\n"
-          "Content-Length: " + std::to_string(size - rangeStart) + "\r\n"
+          "Content-Range: bytes " + std::to_string(reqStart) + "-" + std::to_string(size-1) + "/" + std::to_string(size) + "\r\n"
+          "Content-Length: " + std::to_string(sendLen) + "\r\n"
         : "HTTP/1.1 200 OK\r\n"
-          "Content-Length: " + std::to_string(size) + "\r\n";
+          "Content-Length: " + std::to_string(sendLen) + "\r\n";
     head += std::string("Content-Type: ") + WideToUtf8(MimeFor(ext)) +
             "\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n";
     if(!SendAll(s, head)){ CloseHandle(f); shutdown(s, SD_SEND); closesocket(s); return true; }
 
-    LARGE_INTEGER pos; pos.QuadPart = rangeStart;
+    long long fileOff = reqStart >= tagSize ? reqStart - tagSize : 0;
+    if(tag && reqStart < tagSize){
+        // 请求落在标签区间: 先发标签的剩余部分, 再发文件开头
+        long long tagLen = tagSize - reqStart;
+        if(!SendAll(s, tag->data() + reqStart, (int)tagLen)){ CloseHandle(f); shutdown(s, SD_SEND); closesocket(s); return true; }
+        sendLen -= tagLen;
+    }
+    if(sendLen <= 0){ CloseHandle(f); shutdown(s, SD_SEND); closesocket(s); return true; }
+
+    LARGE_INTEGER pos; pos.QuadPart = fileOff;
     SetFilePointerEx(f, pos, nullptr, FILE_BEGIN);
     char buf[256*1024];   // per-connection thread: keep on stack, not static
-    long long remaining = size - rangeStart;
+    long long remaining = sendLen;
     while(remaining > 0){
         DWORD want = (DWORD)std::min<long long>(sizeof(buf), remaining), got = 0;
         if(!ReadFile(f, buf, want, &got, nullptr) || got == 0) break;
@@ -140,7 +153,7 @@ bool ServeFile(SOCKET s, const std::wstring& path, const std::wstring& ext, long
 }
 
 // cache hit: 查找 {pid}_{tid}.* (.part 未完成文件除外)
-bool TryServeCached(SOCKET s, long long pid, long long tid, long long rangeStart){
+bool TryServeCached(SOCKET s, long long pid, long long tid, long long rangeStart, const std::string* tag){
     WIN32_FIND_DATAW fd;
     std::wstring pat = CacheDir() + L"\\" + std::to_wstring(pid) + L"_" +
                        std::to_wstring(tid) + L".*";
@@ -156,7 +169,7 @@ bool TryServeCached(SOCKET s, long long pid, long long tid, long long rangeStart
     if(fd.nFileSizeLow == 0 && fd.nFileSizeHigh == 0) return false;
 
     FsLog(("cache hit tid=" + std::to_string(tid)).c_str());
-    return ServeFile(s, CacheDir() + L"\\" + name, ext, rangeStart);
+    return ServeFile(s, CacheDir() + L"\\" + name, ext, rangeStart, tag);
 }
 
 // ---------------- CDN streaming via raw WinHTTP handles (pipe to socket + disk cache) ----------------
@@ -226,29 +239,40 @@ int HttpRead(HttpGet& g, char* buf, int len){
     return (int)got;
 }
 
-// pipe CDN -> socket (only bytes >= rangeStart) while caching full content to disk.
+// pipe CDN -> socket (only bytes >= contentSkip) while caching full content to disk.
+// tag: 可选 ID3v2 前缀标签, 虚拟流 = tag + CDN 音频(客户端偏移需减去 tagSize 映射)
 // client disconnect mid-way does NOT abort the download: next play hits the cache.
 bool ProxyAndCache(SOCKET s, long long pid, long long tid, const std::wstring& url,
-                   const std::wstring& ext, long long rangeStart){
+                   const std::wstring& ext, long long reqStart, const std::string* tag){
     HttpGet g;
     if(!HttpOpenGet(url, g)) return false;
 
+    long long tagSize = tag ? (long long)tag->size() : 0;
     long long total = g.total;
+    long long virtualTotal = total > 0 ? total + tagSize : -1;   // 虚拟流总长
+    long long contentSkip = reqStart > tagSize ? reqStart - tagSize : 0;  // 音频内容跳过量
+
     std::string head;
-    if(rangeStart > 0 && total > 0)
+    if(reqStart > 0 && virtualTotal > 0)
         head = "HTTP/1.1 206 Partial Content\r\n"
-               "Content-Range: bytes " + std::to_string(rangeStart) + "-" + std::to_string(total-1) + "/" + std::to_string(total) + "\r\n"
-               "Content-Length: " + std::to_string(total - rangeStart) + "\r\n";
-    else if(total > 0)
-        head = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(total) + "\r\n";
+               "Content-Range: bytes " + std::to_string(reqStart) + "-" + std::to_string(virtualTotal-1) + "/" + std::to_string(virtualTotal) + "\r\n"
+               "Content-Length: " + std::to_string(virtualTotal - reqStart) + "\r\n";
+    else if(virtualTotal > 0)
+        head = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(virtualTotal) + "\r\n";
     else
         head = "HTTP/1.1 200 OK\r\n";
     head += "Accept-Ranges: bytes\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n";
     if(!SendAll(s, head)){ HttpClose(g); shutdown(s, SD_SEND); closesocket(s); return false; }
 
+    bool sendAlive = true;
+    if(tag && reqStart < tagSize){
+        // 请求落在标签区间: 先发标签的剩余部分
+        if(!SendAll(s, tag->data() + reqStart, (int)(tagSize - reqStart))) sendAlive = false;
+    }
+
     std::wstring partPath = CacheDir() + L"\\" + std::to_wstring(pid) + L"_" + std::to_wstring(tid) + L".part";
     std::ofstream cf(partPath.c_str(), std::ios::binary | std::ios::trunc);
-    bool sendAlive = true, dlError = false;
+    bool dlError = false;
     long long pos = 0;
     char buf[64*1024];
     while(true){
@@ -260,8 +284,8 @@ bool ProxyAndCache(SOCKET s, long long pid, long long tid, const std::wstring& u
             if(!cf.good()){ cf.close(); DeleteFileW(partPath.c_str()); } // disk error: drop cache
         }
         if(sendAlive){
-            if(pos < rangeStart){
-                long long skip = std::min<long long>(r, rangeStart - pos);
+            if(pos < contentSkip){
+                long long skip = std::min<long long>(r, contentSkip - pos);
                 if(!SendAll(s, buf + skip, r - (int)skip)) sendAlive = false;
             } else {
                 if(!SendAll(s, buf, r)) sendAlive = false;
@@ -337,8 +361,13 @@ void HandleClient(SOCKET s){
     }
     long long rangeStart = ParseRangeStart(req);
 
+    // 构建 ID3v2 流标签(标题/歌手/专辑/时长/封面) — 由 NcmMeta 从元数据缓存生成,
+    // 使 AIMP 从音频流中解析出歌曲信息(网络流不经 FileInfoProvider 回调)
+    std::string tagBytes = NcmMeta::BuildStreamTag(pid, tid);
+    const std::string* tag = tagBytes.empty() ? nullptr : &tagBytes;
+
     // 1) 缓存命中 → 直接回本地文件
-    if(TryServeCached(s, pid, tid, rangeStart)) return;
+    if(TryServeCached(s, pid, tid, rangeStart, tag)) return;
 
     // 2) resolve ladder: configured quality -> exhigh -> standard
     NcmConfig cfg; ConfigManager::Load(cfg);
@@ -372,7 +401,7 @@ void HandleClient(SOCKET s){
     // 3) 代理播放并落盘缓存
     std::wstring ext = Utf8ToWide(type.empty() ? "mp3" : type);
     std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
-    ProxyAndCache(s, pid, tid, Utf8ToWide(url), ext, rangeStart);
+    ProxyAndCache(s, pid, tid, Utf8ToWide(url), ext, rangeStart, tag);
 }
 
 void AcceptLoop(){
