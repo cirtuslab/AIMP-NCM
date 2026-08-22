@@ -39,6 +39,8 @@ public:
     bool GetUserPlaylists(long long uid, std::vector<NcmPlaylist>& out, int limit=100);
     bool GetPlaylistDetail(long long pid, std::vector<NcmSong>& outSongs, NcmPlaylist* info=nullptr);
     bool GetSongUrl(long long id, std::string& outUrl, std::string& outType);
+    // 指定音质取链(供回退阶梯使用): level 如 standard/exhigh/lossless; reason 返回失败原因
+    bool GetSongUrlLevel(long long id, const std::string& level, std::string& outUrl, std::string& outType, std::string* reason=nullptr);
     bool GetSongDetail(long long id, NcmSong& out);
     bool GetLyric(long long id, std::string& outLrc);
     bool IsLoggedIn();

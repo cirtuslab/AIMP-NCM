@@ -368,6 +368,11 @@ bool NcmClient::GetPlaylistDetail(long long pid, std::vector<NcmSong>& outSongs,
 bool NcmClient::GetSongUrl(long long id, std::string& outUrl, std::string& outType){
     std::string level = WideToUtf8(cfg_.quality);
     if(level.empty()) level="exhigh";
+    return GetSongUrlLevel(id, level, outUrl, outType);
+}
+bool NcmClient::GetSongUrlLevel(long long id, const std::string& levelUtf8, std::string& outUrl, std::string& outType, std::string* reason){
+    auto fail=[&](const char* r){ if(reason) *reason=r; return false; };
+    const std::string level = levelUtf8.empty() ? "exhigh" : levelUtf8;
     // eapi 参数参考 go-musicfox: ids 数组 + level + encodeType + header
     std::string ids = "[" + std::to_string(id) + "]";
     std::string encodeType = (level=="standard"||level=="higher"||level=="exhigh") ? "aac" : "flac";
@@ -411,13 +416,14 @@ bool NcmClient::GetSongUrl(long long id, std::string& outUrl, std::string& outTy
         json data;
         if(js.contains("data") && js["data"].is_array() && !js["data"].empty()) data=js["data"][0];
         else if(js.contains("body") && js["body"].contains("data") && !js["body"]["data"].empty()) data=js["body"]["data"][0];
-        else return false;
+        else return fail("no-data");
         outUrl = data.value("url","");
         outType = data.value("type","mp3");
         int code = data.value("code",0);
-        if(outUrl.empty() || code!=200) return false;
+        if(outUrl.empty()) return fail(("url-empty code="+std::to_string(code)).c_str());
+        if(code!=200) return fail(("code="+std::to_string(code)).c_str());
         return true;
-    } catch(...){ return false; }
+    } catch(...){ return fail("json-parse-error"); }
 }
 bool NcmClient::GetSongDetail(long long id, NcmSong& out){
     json j; j["c"]= std::string("[{\"id\":")+std::to_string(id)+"}]";
