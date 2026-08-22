@@ -22,8 +22,8 @@ PWCHAR AimpNcmPlugin::InfoGet(int Index){
     switch(Index){
     case AIMP_PLUGIN_INFO_NAME: return (PWCHAR)L"AIMP NCM 网易云串流";
     case AIMP_PLUGIN_INFO_AUTHOR: return (PWCHAR)L"cirtuslab / YuzuBD";
-    case AIMP_PLUGIN_INFO_SHORT_DESCRIPTION: return (PWCHAR)L"串流网易云歌单到 AIMP 播放列表 [v1.3 ncm-fs]";
-    case AIMP_PLUGIN_INFO_FULL_DESCRIPTION: return (PWCHAR)L"支持扫码登录、音质选择、歌单同步，基于 NeteaseCloudMusicApi。需配置镜像 http://localhost:3000";
+    case AIMP_PLUGIN_INFO_SHORT_DESCRIPTION: return (PWCHAR)L"串流网易云歌单到 AIMP 播放列表 [v1.4]";
+    case AIMP_PLUGIN_INFO_FULL_DESCRIPTION: return (PWCHAR)L"支持扫码/网页 Cookie 登录、音质选择、歌单同步、歌曲信息与封面显示，基于 NeteaseCloudMusicApi";
     default: return nullptr;
     }
 }

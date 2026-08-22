@@ -21,7 +21,7 @@ if(!$cmakeExe){
 }
 if(!$cmakeExe){
   Write-Host "Downloading portable cmake..."
-  $tmp="$env:TEMP\opencode\cmake"
+  $tmp = Join-Path $env:TEMP "opencode\cmake"
   New-Item -ItemType Directory -Force -Path $tmp | Out-Null
   $zip="$tmp\cmake.zip"
   Invoke-WebRequest -Uri "https://github.com/Kitware/CMake/releases/download/v3.28.0/cmake-3.28.0-windows-x86_64.zip" -OutFile $zip -UseBasicParsing
