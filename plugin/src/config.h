@@ -12,6 +12,8 @@ struct NcmConfig {
     bool lazyM3U = false; // true 时写 ncm:// 懒加载秒级，false 时批量预取真实链接
     std::wstring uid; // user id after login
     int localPort = 47777; // 本地重定向服务端口(播放列表 http://127.0.0.1 条目使用)
+    int cacheDays = 7;     // 播放缓存保留天数; <=0 表示永不自动删除
+    std::wstring cacheWhitelist; // 白名单歌单ID(逗号分隔), 其歌曲缓存永不删除
 };
 
 class ConfigManager {

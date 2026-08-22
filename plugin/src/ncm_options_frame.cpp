@@ -4,6 +4,7 @@
 #include "ncm_client.h"
 #include "http_client.h"
 #include "ncm_login_form.h"
+#include "local_server.h"
 #include "../third_party/aimp_sdk/apiGUI.h"
 #include "../third_party/aimp_sdk/apiOptions.h"
 #include "../third_party/aimp_sdk/apiObjects.h"
@@ -351,6 +352,41 @@ HWND NcmOptionsFrame::CreateFrame(HWND ParentWnd){
                 IAIMPUIWinControl* hint = MakeLabel(rowQuality, L"hint", L"提示：切换音质实时生效，下次播放起生效", 220, 18, 12, 3);
             }
 
+            // ---- 行1.5: 缓存策略(保留时长 + 白名单歌单) ----
+            IAIMPUIWinControl* rowCache = MakeRow(body2, L"rowCache", 24, 8, 420);
+            if(rowCache){
+                MakeLabel(rowCache, L"lblCache", L"缓存保留:", 62, 20, 0, 2);
+                {
+                    CtlEvents* ev = new CtlEvents(this, OnCacheChanged);
+                    IAIMPString* nm = MakeStr(L"cboCache");
+                    hr = uiSvc_->CreateControl(form_, rowCache, nm, (IUnknown*)ev, IID_IAIMPUIComboBox, (void**)&cboCache_);
+                    if(nm) nm->Release();
+                    ev->Release();
+                    if(SUCCEEDED(hr) && cboCache_){
+                        IAIMPUIBaseComboBox* cb=(IAIMPUIBaseComboBox*)cboCache_;
+                        const wchar_t* items[]={L"永不删除",L"1 天",L"3 天",L"7 天",L"30 天"};
+                        for(int i=0;i<5;i++){
+                            IAIMPString* s=MakeStr(items[i]);
+                            if(s){ cb->Add(s, 0); s->Release(); }
+                        }
+                        PlaceLeft(cboCache_, 90, 22, 8, 1);
+                    }
+                }
+                MakeLabel(rowCache, L"lblWL", L"白名单歌单ID:", 92, 20, 10, 2);
+                {
+                    CtlEvents* ev = new CtlEvents(this, OnCacheChanged);
+                    IAIMPString* nm = MakeStr(L"eCacheWL");
+                    hr = uiSvc_->CreateControl(form_, rowCache, nm, (IUnknown*)ev, IID_IAIMPUIEdit, (void**)&eCacheWL_);
+                    if(nm) nm->Release();
+                    ev->Release();
+                    if(SUCCEEDED(hr) && eCacheWL_){
+                        eCacheWL_->SetValueAsObject(AIMPUI_EDIT_PROPID_TEXTHINT,
+                            MakeStr(L"这些歌单的缓存永不删除，逗号分隔"));
+                        PlaceLeft(eCacheWL_, 160, 22, 6, 1);
+                    }
+                }
+            }
+
             // ---- 行2: 歌单标题 + 计数 ----
             IAIMPUIWinControl* rowTitle = MakeRow(body2, L"rowTitle", 20, 8, 420);
             if(rowTitle){
@@ -415,11 +451,17 @@ void NcmOptionsFrame::DestroyFrame(){
     if(btnRefresh_){ btnRefresh_->Release(); btnRefresh_=nullptr; }
     if(lblCnt_){ lblCnt_->Release(); lblCnt_=nullptr; }
     if(lst_){ lst_->Release(); lst_=nullptr; }
+    if(cboCache_){ cboCache_->Release(); cboCache_=nullptr; }
+    if(eCacheWL_){ eCacheWL_->Release(); eCacheWL_=nullptr; }
     if(form_){ ((IUnknown*)form_)->Release(); form_=nullptr; }
 }
 
 void NcmOptionsFrame::Notification(int ID){
-    if(ID==0x3){ SaveConfig(false); StartSync(); }  // 应用/确定: 保存后自动同步到播放列表
+    if(ID==0x3){
+        SaveConfig(false);
+        StartSync();
+        LocalServer::RunCleanupNow();  // 应用后按新缓存策略立即执行一次清理
+    }
     else if(ID==0x1) LoadConfig();
 }
 
@@ -494,6 +536,18 @@ void NcmOptionsFrame::LoadConfig(){
         int sel=2; for(int i=0;i<8;i++) if(cfg.quality==levels[i]) sel=i;
         cb->SetValueAsInt32(AIMPUI_COMBOBOX_PROPID_ITEMINDEX, sel);
     }
+    // 缓存策略
+    {
+        static const int days[5] = { -1, 1, 3, 7, 30 };
+        int idx = 3; // 默认 7 天
+        for(int i=0;i<5;i++) if(cfg.cacheDays==days[i]) idx=i;
+        if(cboCache_){
+            IAIMPUIBaseComboBox* cb=(IAIMPUIBaseComboBox*)cboCache_;
+            cb->SetValueAsInt32(AIMPUI_COMBOBOX_PROPID_ITEMINDEX, idx);
+        }
+        if(eCacheWL_ && !cfg.cacheWhitelist.empty())
+            eCacheWL_->SetValueAsObject(AIMPUI_BASEEDIT_PROPID_TEXT, MakeStr(cfg.cacheWhitelist.c_str()));
+    }
     if(st_){
         std::wstring s = L"就绪";
         if(!cfg.cookie.empty()) s = L"已登录 · Cookie 已保存";
@@ -548,6 +602,18 @@ void NcmOptionsFrame::SaveConfig(bool notify){
         int sel=0; cbo_->GetValueAsInt32(AIMPUI_COMBOBOX_PROPID_ITEMINDEX, &sel);
         const wchar_t* levels[]={L"standard",L"higher",L"exhigh",L"lossless",L"hires",L"jymaster",L"jyeffect",L"sky"};
         if(sel>=0&&sel<8) cfg.quality = levels[sel];
+    }
+    // 缓存策略: 下拉 -> 天数(-1=永不); 白名单歌单ID
+    if(cboCache_){
+        int idx=3; cboCache_->GetValueAsInt32(AIMPUI_COMBOBOX_PROPID_ITEMINDEX, &idx);
+        static const int days[5] = { -1, 1, 3, 7, 30 };
+        if(idx>=0&&idx<5) cfg.cacheDays = days[idx];
+        else cfg.cacheDays = 7;
+    }
+    if(eCacheWL_){
+        IAIMPString* s=nullptr;
+        eCacheWL_->GetValueAsObject(AIMPUI_BASEEDIT_PROPID_TEXT, IID_IAIMPString, (void**)&s);
+        if(s){ cfg.cacheWhitelist = AimpStringToWString(s); s->Release(); }
     }
     // 收集歌单树当前勾选状态(此前勾选从未被保存, "应用"也不会点亮)
     CollectSelection(cfg);

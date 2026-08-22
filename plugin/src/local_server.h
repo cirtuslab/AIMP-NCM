@@ -7,4 +7,6 @@ namespace LocalServer {
     // 启动服务; preferredPort 被占用时自动向后尝试; 成功时经 boundPort 返回实际端口
     bool Start(int preferredPort, int* boundPort);
     void Stop();
+    // 立即按当前配置执行一次缓存清理(设置保存后调用)
+    void RunCleanupNow();
 }

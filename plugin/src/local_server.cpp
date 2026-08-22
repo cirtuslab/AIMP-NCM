@@ -11,6 +11,7 @@
 #include <string>
 #include <fstream>
 #include <algorithm>
+#include <set>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winhttp.lib")
@@ -32,15 +33,41 @@ std::wstring CacheDir(){
 }
 
 void CleanupOldCache(){
-    // delete cache files older than 7 days
+    // 策略: cfg.cacheDays<=0 表示永不自动删除; 白名单歌单(pid)的缓存跳过
+    NcmConfig cfg; ConfigManager::Load(cfg);
+    if(cfg.cacheDays < 0) return;
+
+    std::set<long long> whitelist;
+    {
+        const wchar_t* s = cfg.cacheWhitelist.c_str();
+        while(*s){
+            if(iswdigit(*s)){
+                long long v = 0;
+                while(iswdigit(*s)){ v = v*10 + (*s - L'0'); ++s; }
+                whitelist.insert(v);
+            } else ++s;
+        }
+    }
+
+    const ULONGLONG maxAgeMs = (cfg.cacheDays > 0 ? (ULONGLONG)cfg.cacheDays : 7ull)
+                               * 24ull * 3600ull * 1000ull;
     WIN32_FIND_DATAW fd;
     std::wstring pat = CacheDir() + L"\\*";
     HANDLE h = FindFirstFileW(pat.c_str(), &fd);
     if(h == INVALID_HANDLE_VALUE) return;
-    const ULONGLONG weekMs = 7ull * 24 * 3600 * 1000;
     do{
         if(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        std::wstring full = CacheDir() + L"\\" + fd.cFileName;
+        // 文件名: {pid}_{tid}.{ext}; 旧格式 {tid}.{ext} 无歌单归属, 不受白名单保护
+        std::wstring name = fd.cFileName;
+        size_t under = name.find(L'_');
+        long long pid = -1;
+        bool hasPid = false;
+        if(under != std::wstring::npos && under > 0 && iswdigit(name[0])){
+            try{ pid = std::stoll(name.substr(0, under)); hasPid = true; }catch(...){}
+        }
+        if(hasPid && whitelist.count(pid)) continue;   // 白名单歌单缓存永不删除
+
+        std::wstring full = CacheDir() + L"\\" + name;
         HANDLE f = CreateFileW(full.c_str(), GENERIC_READ,
                                FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
                                nullptr, OPEN_EXISTING, 0, nullptr);
@@ -49,7 +76,7 @@ void CleanupOldCache(){
         CloseHandle(f);
         ULARGE_INTEGER u; u.LowPart = wt.dwLowDateTime; u.HighPart = wt.dwHighDateTime;
         ULONGLONG ms = u.QuadPart / 10000;
-        if(GetTickCount64() - ms > weekMs) DeleteFileW(full.c_str());
+        if(GetTickCount64() - ms > maxAgeMs) DeleteFileW(full.c_str());
     }while(FindNextFileW(h, &fd));
     FindClose(h);
 }
@@ -112,10 +139,11 @@ bool ServeFile(SOCKET s, const std::wstring& path, const std::wstring& ext, long
     return true;
 }
 
-// cache hit: find {tid}.* in cache dir (.part unfinished files excluded)
-bool TryServeCached(SOCKET s, long long tid, long long rangeStart){
+// cache hit: 查找 {pid}_{tid}.* (.part 未完成文件除外)
+bool TryServeCached(SOCKET s, long long pid, long long tid, long long rangeStart){
     WIN32_FIND_DATAW fd;
-    std::wstring pat = CacheDir() + L"\\" + std::to_wstring(tid) + L".*";
+    std::wstring pat = CacheDir() + L"\\" + std::to_wstring(pid) + L"_" +
+                       std::to_wstring(tid) + L".*";
     HANDLE h = FindFirstFileW(pat.c_str(), &fd);
     if(h == INVALID_HANDLE_VALUE) return false;
     std::wstring name = fd.cFileName;
@@ -200,7 +228,7 @@ int HttpRead(HttpGet& g, char* buf, int len){
 
 // pipe CDN -> socket (only bytes >= rangeStart) while caching full content to disk.
 // client disconnect mid-way does NOT abort the download: next play hits the cache.
-bool ProxyAndCache(SOCKET s, long long tid, const std::wstring& url,
+bool ProxyAndCache(SOCKET s, long long pid, long long tid, const std::wstring& url,
                    const std::wstring& ext, long long rangeStart){
     HttpGet g;
     if(!HttpOpenGet(url, g)) return false;
@@ -218,7 +246,7 @@ bool ProxyAndCache(SOCKET s, long long tid, const std::wstring& url,
     head += "Accept-Ranges: bytes\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n";
     if(!SendAll(s, head)){ HttpClose(g); shutdown(s, SD_SEND); closesocket(s); return false; }
 
-    std::wstring partPath = CacheDir() + L"\\" + std::to_wstring(tid) + L".part";
+    std::wstring partPath = CacheDir() + L"\\" + std::to_wstring(pid) + L"_" + std::to_wstring(tid) + L".part";
     std::ofstream cf(partPath.c_str(), std::ios::binary | std::ios::trunc);
     bool sendAlive = true, dlError = false;
     long long pos = 0;
@@ -246,7 +274,7 @@ bool ProxyAndCache(SOCKET s, long long tid, const std::wstring& url,
     bool complete = !dlError && (total < 0 || pos >= total);
     if(complete && pos > 0){
         if(cf.is_open()) cf.close();
-        std::wstring finalPath = CacheDir() + L"\\" + std::to_wstring(tid) + L"." + ext;
+        std::wstring finalPath = CacheDir() + L"\\" + std::to_wstring(pid) + L"_" + std::to_wstring(tid) + L"." + ext;
         DeleteFileW(finalPath.c_str()); // MoveFile does not overwrite existing target
         if(MoveFileW(partPath.c_str(), finalPath.c_str()))
             FsLog(("cached tid=" + std::to_string(tid)).c_str());
@@ -309,8 +337,8 @@ void HandleClient(SOCKET s){
     }
     long long rangeStart = ParseRangeStart(req);
 
-    // 1) cache hit -> serve local file
-    if(TryServeCached(s, tid, rangeStart)) return;
+    // 1) 缓存命中 → 直接回本地文件
+    if(TryServeCached(s, pid, tid, rangeStart)) return;
 
     // 2) resolve ladder: configured quality -> exhigh -> standard
     NcmConfig cfg; ConfigManager::Load(cfg);
@@ -341,10 +369,10 @@ void HandleClient(SOCKET s){
         FsLog(b);
     }
 
-    // 3) proxy stream to AIMP and cache to disk
+    // 3) 代理播放并落盘缓存
     std::wstring ext = Utf8ToWide(type.empty() ? "mp3" : type);
     std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
-    ProxyAndCache(s, tid, Utf8ToWide(url), ext, rangeStart);
+    ProxyAndCache(s, pid, tid, Utf8ToWide(url), ext, rangeStart);
 }
 
 void AcceptLoop(){
@@ -359,6 +387,10 @@ void AcceptLoop(){
 } // namespace
 
 namespace LocalServer {
+
+void RunCleanupNow(){
+    CleanupOldCache();
+}
 
 bool Start(int preferredPort, int* boundPort){
     WSADATA wsa;

@@ -28,6 +28,8 @@ bool ConfigManager::Load(NcmConfig& cfg) {
         cfg.lazyM3U = j.value("lazyM3U", false);
         cfg.uid = Utf8ToWide(j.value("uid",""));
         cfg.localPort = j.value("localPort", 47777);
+        cfg.cacheDays = j.value("cacheDays", 7);
+        cfg.cacheWhitelist = Utf8ToWide(j.value("cacheWhitelist",""));
         cfg.selectedPlaylists.clear();
         if (j.contains("selectedPlaylists") && j["selectedPlaylists"].is_array()) {
             for (auto& v : j["selectedPlaylists"]) cfg.selectedPlaylists.push_back(v.get<long long>());
@@ -45,6 +47,8 @@ bool ConfigManager::Save(const NcmConfig& cfg) {
     j["lazyM3U"] = cfg.lazyM3U;
     j["uid"] = WideToUtf8(cfg.uid);
     j["localPort"] = cfg.localPort;
+    j["cacheDays"] = cfg.cacheDays;
+    j["cacheWhitelist"] = WideToUtf8(cfg.cacheWhitelist);
     j["selectedPlaylists"] = cfg.selectedPlaylists;
     std::ofstream f(WideToUtf8(p));
     if (!f) return false;

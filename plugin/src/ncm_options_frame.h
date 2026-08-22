@@ -46,6 +46,7 @@ private:
     static void OnQrClicked(NcmOptionsFrame* self);
     static void OnRefreshClicked(NcmOptionsFrame* self);
     static void OnTreeChanged(NcmOptionsFrame* self);
+    static void OnCacheChanged(NcmOptionsFrame* self){ self->SaveConfig(true); }
 
     // 遍历歌单树, 把勾选节点的 TAG 收集进 cfg.selectedPlaylists
     void CollectSelection(NcmConfig& cfg);
@@ -91,6 +92,8 @@ private:
     IAIMPUIButton* btnRefresh_ = nullptr;
     IAIMPUIWinControl* lblCnt_ = nullptr;
     IAIMPUITreeList* lst_ = nullptr;
+    IAIMPUIWinControl* cboCache_ = nullptr;   // 缓存保留时长下拉
+    IAIMPUIWinControl* eCacheWL_ = nullptr;   // 白名单歌单ID输入框
 
     bool loading_ = false;
 };
