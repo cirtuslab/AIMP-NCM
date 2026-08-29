@@ -1,7 +1,7 @@
 AIMP NCM (网易云串流)
 =====================
 
-[v1.5] Stream NetEase Cloud Music playlists into AIMP 5.x.
+[v1.5.0] Stream NetEase Cloud Music playlists into AIMP 5.x.
 
 Playlist entries are served through the plugin's built-in local proxy
 (http://127.0.0.1), which resolves the real CDN link on playback, injects an
@@ -9,7 +9,7 @@ ID3v2.3 tag (title / artist / album / duration / cover / optional USLT lyrics)
 into the stream, and caches audio for Range/seek.
 
 Features:
-- QR-code login / paste MUSIC_U cookie (browser import available in GUI)
+- Paste MUSIC_U cookie to sign in
 - Quality selection: standard / higher / exhigh / lossless / hires /
   jymaster / jyeffect / sky (auto fallback)
 - One-click playlist sync to the "网易云串流" playlist
