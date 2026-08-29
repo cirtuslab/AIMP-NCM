@@ -20,6 +20,8 @@ set(NCM_RC_STAGE "${NCM_RC_STAGE}/aimp_ncm_rc_stage")
 file(MAKE_DIRECTORY "${NCM_RC_STAGE}")
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/resources/plugin.rc" "${NCM_RC_STAGE}/plugin.rc" COPYONLY)
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/resources/resource.h" "${NCM_RC_STAGE}/resource.h" COPYONLY)
+# L5: plugin.rc 以相对路径引用内嵌 manifest, 必须一并暂存到同一目录
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/resources/plugin.manifest" "${NCM_RC_STAGE}/plugin.manifest" COPYONLY)
 
 add_library(aimp_ncm SHARED ${SRC} "${NCM_RC_STAGE}/plugin.rc" "${CMAKE_CURRENT_SOURCE_DIR}/plugin.def")
 if(MSVC)

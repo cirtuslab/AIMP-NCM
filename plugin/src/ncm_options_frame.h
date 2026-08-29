@@ -33,7 +33,7 @@ public:
     BOOL WINAPI SelectFirstControl() override { return FALSE; }
     BOOL WINAPI SelectNextControl(BOOL FindForward, BOOL CheckTabStop) override { return FALSE; }
 
-    // 供 FrameWndProc 调用的公共方法
+    // 供后台任务回传后主线程直接调用的公共方法
     IAIMPString* MakeStr(const wchar_t* s);
     HWND GetHandle();
     void LoadConfig();
@@ -78,19 +78,14 @@ private:
     IAIMPUIWinControl* MakeLabel(IAIMPUIWinControl* parent, const wchar_t* name,
         const wchar_t* text, int w, int h, int marginLeft, int marginTop);
 
-    static LRESULT CALLBACK FrameWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
-
-    // 后台线程通知用的隐藏消息窗口(自己创建并拥有, 不子类化 AIMP 表单,
-    // 避免占用 AIMP 窗口的 GWLP_USERDATA / 句柄重建导致通知丢失)
-    HWND NotifWnd();
+    // L4: 原 FrameWndProc/NotifWnd 与隐藏消息窗口(WM_USER+2/3/5 通知通道)已移除 ——
+    //     v1.5 起后台任务经 ProgCtx + 进度对话框直接回传结果
 
     volatile LONG ref_ = 1;
     IAIMPCore* core_ = nullptr;
     IAIMPServiceUI* uiSvc_ = nullptr;
     IAIMPServiceOptionsDialog* optSvc_ = nullptr;
     IAIMPUIForm* form_ = nullptr;
-    HWND notifWnd_ = nullptr;      // 隐藏消息窗口
-    WNDPROC notifPrevProc_ = nullptr; // 其原始窗口过程
 
     // 控件引用
     IAIMPUICheckBox* chkProxy_ = nullptr;

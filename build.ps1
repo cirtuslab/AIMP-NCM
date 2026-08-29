@@ -67,8 +67,7 @@ if(!(Test-Path "$stage\aimp_ncm.dll")){
   Copy-Item -Force (Join-Path $buildDirX86 "plugin\aimp_ncm.dll") "$stage\aimp_ncm.dll" -ErrorAction SilentlyContinue
 }
 Copy-Item -Force (Join-Path $PSScriptRoot "packaging\ReadMe.txt") $stage -ErrorAction SilentlyContinue
-Copy-Item -Force (Join-Path $PSScriptRoot "packaging\manifest.xml") (Join-Path $stage "aimp_ncm.dll.manifest") -ErrorAction SilentlyContinue
-Copy-Item -Force (Join-Path $PSScriptRoot "packaging\manifest.xml") (Join-Path $stage "x64\aimp_ncm.dll.manifest") -ErrorAction SilentlyContinue
+# L5: manifest 已内嵌进 DLL 资源(RT_MANIFEST), 不再随包分发无效的外部 .dll.manifest
 Set-Content -LiteralPath (Join-Path $stage "LICENSE") -Value "MIT" -Encoding UTF8 -ErrorAction SilentlyContinue
 
 $zipTmp = Join-Path $buildDir "AIMP_NCM.zip"

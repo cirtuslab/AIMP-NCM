@@ -6,6 +6,7 @@
 #include <ctime>
 #include <cstdlib>
 #include <sstream>
+#include <random>
 #include <wincrypt.h>
 #pragma comment(lib, "crypt32.lib")
 using json = nlohmann::json;
@@ -245,13 +246,14 @@ void NcmClient::EnsureDeviceCookie(){
     NcmConfig cfg; ConfigManager::Load(cfg);
     if(!cfg.deviceCookie.empty()){ deviceId_ = cfg.deviceCookie; return; }
     deviceId_ = BuildDeviceCookie();
-    cfg.deviceCookie = deviceId_;
-    ConfigManager::Save(cfg);
+    // M1: 字段级更新, 避免后台线程用旧快照整份回写、覆盖用户并发保存的其它设置
+    ConfigManager::UpdateDeviceCookie(deviceId_);
 }
 std::wstring NcmClient::BuildDeviceCookie(){
     // 初始化/补全设备 Cookie
     // 参考 NeteaseCloudMusicApiEnhanced processCookieObject + go-musicfox
-    srand((unsigned)time(nullptr));   // C2: 时间戳播种 rand(), 避免固定序列
+    // M5: 不再用 srand/rand(会污染宿主进程 AIMP 的全局随机状态),
+    //     随机源统一走 NcmCrypto::RandomString(mt19937+random_device)
     std::wstring deviceId_;
     if(deviceId_.empty()){
         deviceId_ = L"os=pc; appver=2.7.1.198277; osver=10; __remember_me=true; "
@@ -278,9 +280,8 @@ std::wstring NcmClient::BuildDeviceCookie(){
     return deviceId_;
 }
 void NcmClient::RegenerateDeviceCookie(){
-    NcmConfig cfg; ConfigManager::Load(cfg);
-    cfg.deviceCookie = BuildDeviceCookie();
-    ConfigManager::Save(cfg);
+    // M1: 只更新 deviceCookie 字段, 不回写整份配置
+    ConfigManager::UpdateDeviceCookie(BuildDeviceCookie());
 }
 bool NcmClient::GetAccountId(long long& uid){
     // 双模式获取当前账号 uid: 镜像走 /user/account, 直连走 weapi /api/nuser/account/get
@@ -455,7 +456,10 @@ bool NcmClient::GetSongUrlLevel(long long id, const std::string& levelUtf8, std:
     header["__csrf"]="";
     header["os"]="pc";
     header["channel"]="";
-    header["requestId"]=std::to_string(time(nullptr)*1000) + std::to_string(rand()%1000);
+    // M5: requestId 的随机部分不再用 rand()(全局状态), 改用线程局部 mt19937
+    static thread_local std::mt19937 s_rng{std::random_device{}()};
+    std::uniform_int_distribution<int> s_dist(0, 999);
+    header["requestId"]=std::to_string(time(nullptr)*1000) + std::to_string(s_dist(s_rng));
     if(cfg_.cookie.find(L"MUSIC_U=")!=std::wstring::npos){
         // 只取 MUSIC_U= 的值, 不能把整条 cookie 串塞进 header
         size_t p = cfg_.cookie.find(L"MUSIC_U=") + 8;

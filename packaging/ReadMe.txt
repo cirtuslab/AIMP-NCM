@@ -1,7 +1,7 @@
 AIMP NCM (网易云串流)
 =====================
 
-[v1.5.0] Stream NetEase Cloud Music playlists into AIMP 5.x.
+[v1.5.1] Stream NetEase Cloud Music playlists into AIMP 5.x.
 
 Playlist entries are served through the plugin's built-in local proxy
 (http://127.0.0.1), which resolves the real CDN link on playback, injects an

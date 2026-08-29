@@ -1,5 +1,6 @@
 <?xml version='1.0' encoding='UTF-8' standalone='yes'?>
 <assembly xmlns='urn:schemas-microsoft-com:asm.v1' manifestVersion='1.0'>
+  <assemblyIdentity type='win32' name='AIMP.NCM.Plugin' version='1.5.1.0' processorArchitecture='*' />
   <dependency>
     <dependentAssembly>
       <assemblyIdentity type='win32' name='Microsoft.Windows.Common-Controls'
@@ -14,4 +15,11 @@
       </requestedPrivileges>
     </security>
   </trustInfo>
+  <!-- L5: 尽力而为的 UTF-8 代码页声明(仅 Win10 1903+ 且被进程采纳时生效;
+       DLL manifest 不会改写宿主进程 ACP, 运行时路径兼容仍依赖代码内宽字符实现) -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
 </assembly>

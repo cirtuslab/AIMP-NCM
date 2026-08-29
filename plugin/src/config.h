@@ -23,4 +23,8 @@ public:
     static bool Load(NcmConfig& cfg);
     static bool Save(const NcmConfig& cfg);
     static bool Clear();
+    // M1: 字段级更新(锁内 Load-Modify-Save)。后台线程只改单字段,
+    //     避免用旧快照整份回写、覆盖用户并发保存的其它设置。
+    static bool UpdateUid(const std::wstring& uid);
+    static bool UpdateDeviceCookie(const std::wstring& deviceCookie);
 };

@@ -141,7 +141,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _dispatch(self, q):
         self.send_response(200)
         self.send_header("Content-Type","application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin","*")
+        # M5: 不发送通配 CORS 头 —— 本服务只面向本机插件(WinHTTP 客户端, 不受 CORS 约束),
+        #     开放跨域会让任意网页(含 DNS rebinding)把本机当作访问网易云的匿名中转
         self.end_headers()
         try:
             path = q.pop("_path","")

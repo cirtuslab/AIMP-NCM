@@ -2,3 +2,6 @@
 #include <windows.h>
 #pragma code_page(65001)
 
+// L5: 内嵌 manifest —— Windows 加载器只认 DLL 的内嵌 manifest,
+//     外部 <dll名>.dll.manifest 文件对 DLL 无效, 因此必须打进资源(RT_MANIFEST = 24)
+1 24 "plugin.manifest"

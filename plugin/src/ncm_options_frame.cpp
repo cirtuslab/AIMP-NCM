@@ -120,7 +120,9 @@ namespace {
         const ULONGLONG kMinShowMs = 2500;   // 最短显示时间: 快速任务(<2.5s)也不闪一下
         IAIMPServiceUI* uiSvc = nullptr;
         if(!core || FAILED(core->QueryInterface(IID_IAIMPServiceUI, (void**)&uiSvc)) || !uiSvc){
-            WaitForSingleObject(ctx->done, 60000);   // 无 UI 服务: 退化为直接等待
+            // M4: 必须等到 worker 结束再返回 —— 上层要读 ctx 结果并 delete ctx,
+            //     此处超时返回会造成 use-after-free(worker 有网络超时, 不会永久挂起)
+            WaitForSingleObject(ctx->done, INFINITE);
             return;
         }
         ProgressEvents* ev = new ProgressEvents(ctx);
@@ -129,7 +131,7 @@ namespace {
         ev->Release();   // AIMP 持有引用
         if(FAILED(hr) || !dlg){
             uiSvc->Release();
-            WaitForSingleObject(ctx->done, 60000);
+            WaitForSingleObject(ctx->done, INFINITE);   // M4: 同上, 不允许超时提前返回
             return;
         }
         dlg->SetValueAsObject(AIMPUI_PROGRESSDLG_PROPID_CAPTION, self->MakeStr(L"AIMP NCM"));
@@ -324,9 +326,11 @@ void NcmOptionsFrame::OnTreeChanged(NcmOptionsFrame* self){
     if(self->optSvc_) self->optSvc_->FrameModified(self);
     // 更新已选计数
     if(self->lblCnt_){
-        NcmConfig c; ConfigManager::Load(c);
+        // L3: 显示树中实际勾选数(勾选尚未保存时, config 里还是上一次的旧值)
+        NcmConfig cur;
+        self->CollectSelection(cur);
         wchar_t buf[64];
-        swprintf_s(buf, L"已选 %zu 个", c.selectedPlaylists.size());
+        swprintf_s(buf, L"已选 %zu 个", cur.selectedPlaylists.size());
         self->lblCnt_->SetValueAsObject(AIMPUI_LABEL_PROPID_TEXT, self->MakeStr(buf));
     }
 }
@@ -348,24 +352,8 @@ HWND NcmOptionsFrame::CreateFrame(HWND ParentWnd){
     if(fn) fn->Release();
     if(FAILED(hr) || !form_) return nullptr;
 
-    // 创建自己的隐藏消息窗口接收后台线程的 WM_USER+2/3 通知。
-    // 之前把窗口过程子类化到 AIMP 表单上并占用其 GWLP_USERDATA，
-    // AIMP 内部管理该窗口时会使 self 指针失效 -> 通知全部丢失(卡在"正在拉取歌单")
-    {
-        static ATOM cls = 0;
-        if(!cls){
-            WNDCLASSW wc = {};
-            wc.lpfnWndProc = DefWindowProcW;
-            wc.hInstance = GetModuleHandleW(L"aimp_ncm.dll");
-            wc.lpszClassName = L"AIMP_NCM_NotifWnd";
-            cls = RegisterClassW(&wc);
-        }
-        notifWnd_ = CreateWindowExW(0, L"AIMP_NCM_NotifWnd", L"", 0, 0,0,0,0, HWND_MESSAGE, nullptr, GetModuleHandleW(L"aimp_ncm.dll"), nullptr);
-        if(notifWnd_){
-            SetWindowLongPtrW(notifWnd_, GWLP_USERDATA, (LONG_PTR)this);
-            notifPrevProc_ = (WNDPROC)SetWindowLongPtrW(notifWnd_, GWLP_WNDPROC, (LONG_PTR)NcmOptionsFrame::FrameWndProc);
-        }
-    }
+    // L4: v1.5 起后台任务经 ProgCtx + 进度对话框直接回传结果,
+    //     原"隐藏消息窗口 + WM_USER+2/3/5 通知"通道已无发送方, 整体移除
 
     // 根容器：占满整个页面
     IAIMPUIWinControl* root=nullptr;
@@ -577,19 +565,7 @@ HWND NcmOptionsFrame::CreateFrame(HWND ParentWnd){
     return ((IAIMPUIWinControl*)form_)->GetHandle();
 }
 
-HWND NcmOptionsFrame::NotifWnd(){
-    // 优先用自有消息窗口; 不可用时回退表单句柄
-    if(notifWnd_ && IsWindow(notifWnd_)) return notifWnd_;
-    return GetHandle();
-}
-
 void NcmOptionsFrame::DestroyFrame(){
-    // 先销毁自有消息窗口(WM_NCDESTROY 中自动还原窗口过程)
-    if(notifWnd_){
-        HWND w = notifWnd_; notifWnd_ = nullptr;
-        if(IsWindow(w)) DestroyWindow(w);
-        notifPrevProc_ = nullptr;
-    }
     if(chkProxy_){ chkProxy_->Release(); chkProxy_=nullptr; }
     if(eApi_){ eApi_->Release(); eApi_=nullptr; }
     if(btnTest_){ btnTest_->Release(); btnTest_=nullptr; }
@@ -688,6 +664,8 @@ void NcmOptionsFrame::StartSync(){
     });
 
     RunProgressDialog(this, core_, ctx);
+    // M4: 无论对话框走了哪条路径, 先确保 worker 已结束再读结果/释放 ctx
+    WaitForSingleObject(ctx->done, INFINITE);
     if(ctx->cancel.load()){
         ShowStatus(L"已取消同步");
     } else if(ctx->resultCode == 0){
@@ -911,8 +889,9 @@ void NcmOptionsFrame::RefreshPlaylists(){
         long long uid=0;
         if(!cfg.uid.empty()) uid=_wtoi64(cfg.uid.c_str());
         if(uid==0 && client.GetAccountId(uid)){
+            // M1: 字段级更新 uid, 避免网络等待期间用户改动的其它设置被旧快照回滚
             cfg.uid = std::to_wstring(uid);
-            ConfigManager::Save(cfg);
+            ConfigManager::UpdateUid(cfg.uid);
         }
         if(uid==0){
             ctx->resultCode = 1;
@@ -921,7 +900,6 @@ void NcmOptionsFrame::RefreshPlaylists(){
                 : L"已填入 Cookie 但获取 UID 失败 · 请检查网络/镜像可用性，确认 MUSIC_U 有效后重试";
             SetEvent(ctx->done); return;
         }
-        if(cfg.uid.empty()){ cfg.uid = std::to_wstring(uid); ConfigManager::Save(cfg); }
         if(client.GetUserPlaylists(uid, ctx->playlists, 200)){
             ctx->resultCode = 0;
         } else {
@@ -936,6 +914,8 @@ void NcmOptionsFrame::RefreshPlaylists(){
     });
 
     RunProgressDialog(this, core_, ctx);
+    // M4: 先确保 worker 已结束再读结果/释放 ctx
+    WaitForSingleObject(ctx->done, INFINITE);
     if(ctx->cancel.load()){
         ShowStatus(L"已取消拉取歌单");
     } else if(ctx->resultCode == 0){
@@ -966,17 +946,20 @@ void NcmOptionsFrame::TestConnection(){
             ctx->resultCode = 0;
             ctx->resultMsg = L"直连模式：无需测试（将直连 music.163.com，使用 weapi/eapi）";
         } else {
+            // L2: 探测 /user/account —— 扫码登录已废弃, /login/qr/key 不再代表镜像健康度;
+            //     只要镜像返回含 code 字段的 JSON 即认为可用(不要求已登录)
             std::wstring url = api;
             if(!url.empty() && url.back()==L'/') url.pop_back();
-            url += L"/login/qr/key?timestamp=" + std::to_wstring(GetTickCount());
+            url += L"/user/account";
             auto r = HttpClient::Get(url);
-            if(r.status==200 && r.body.find("unikey")!=std::string::npos){
+            auto js = nlohmann::json::parse(r.body, nullptr, false);
+            if(r.status==200 && !js.is_discarded() && js.contains("code")){
                 ctx->resultCode = 0;
                 ctx->resultMsg = L"连接成功 · 镜像可用 (" + api + L")";
             } else if(r.status!=0){
                 char b[64]; sprintf_s(b,"HTTP %d", r.status);
                 ctx->resultCode = 1;
-                ctx->resultMsg = L"连接失败 · " + Utf8ToWide(b) + L"  请检查镜像是否启动 (npm start)";
+                ctx->resultMsg = L"连接失败 · " + Utf8ToWide(b) + L"  请检查镜像服务是否已启动 (server.js / app.py)";
             } else {
                 ctx->resultCode = 1;
                 ctx->resultMsg = L"连接失败 · 无法访问 " + api + L"  请检查地址/防火墙";
@@ -990,6 +973,8 @@ void NcmOptionsFrame::TestConnection(){
     });
 
     RunProgressDialog(this, core_, ctx);
+    // M4: 先确保 worker 已结束再读结果/释放 ctx
+    WaitForSingleObject(ctx->done, INFINITE);
     if(ctx->cancel.load()){
         ShowStatus(L"已取消测试");
     } else {
@@ -1004,117 +989,6 @@ HWND NcmOptionsFrame::GetHandle(){
     return ((IAIMPUIWinControl*)form_)->GetHandle();
 }
 
-// ---------- 消息处理（PostMessage 回主线程更新） ----------
-
-LRESULT CALLBACK NcmOptionsFrame::FrameWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam){
-    NcmOptionsFrame* self=(NcmOptionsFrame*)GetWindowLongPtrW(hWnd,GWLP_USERDATA);
-    WNDPROC prev = self ? self->notifPrevProc_ : nullptr;
-    switch(msg){
-    case WM_USER+2:{
-        std::wstring* p=(std::wstring*)lParam;
-        if(p){
-            if(self->st_ && IsWindow(hWnd)) self->st_->SetValueAsObject(AIMPUI_LABEL_PROPID_TEXT, self->MakeStr(p->c_str()));
-            delete p;
-        }
-        return 0;
-    }
-    case WM_USER+3:{
-        struct Data{ NcmOptionsFrame* f; std::vector<NcmPlaylist> p; };
-        Data* d=(Data*)lParam;
-        if(d && self->lst_ && IsWindow(hWnd)){
-            self->loading_ = true;  // 程序化填充期间屏蔽 OnTreeChanged
-            // 清空现有节点
-            self->lst_->Clear();
-            IAIMPUITreeListNode* root=nullptr;
-            if(SUCCEEDED(self->lst_->GetRootNode(IID_IAIMPUITreeListNode, (void**)&root)) && root){
-                NcmConfig cfgSel; ConfigManager::Load(cfgSel);  // 只读一次, 别在节点循环里反复读盘
-                // 通过 SetPath 添加顶层节点
-                for(auto& pl : d->p){
-                    std::wstring txt = pl.name + L"  ·  " + std::to_wstring(pl.trackCount) + L"首";
-                    if(!pl.creator.empty()) txt += L"  ·  " + pl.creator;
-                    // 节点文本用 IAIMPString
-                    IAIMPString* s = self->MakeStr(txt.c_str());
-                    if(s){
-                        IAIMPUITreeListNode* node=nullptr;
-                        // 添加子节点到根
-                        if(SUCCEEDED(root->Add(&node)) && node){
-                            node->SetValue(0, s); // 列 0 文本
-                            node->SetValueAsInt64(AIMPUI_TL_NODE_PROPID_TAG, pl.id);
-                            bool sel = std::find(cfgSel.selectedPlaylists.begin(), cfgSel.selectedPlaylists.end(), pl.id)!=cfgSel.selectedPlaylists.end();
-                            node->SetValueAsInt32(AIMPUI_TL_NODE_PROPID_CHECKED, sel?AIMPUI_CHECKSTATE_CHECKED:AIMPUI_CHECKSTATE_UNCHECKED);
-                            node->Release();
-                        }
-                        s->Release();
-                    }
-                }
-                root->Release();
-            }
-            wchar_t buf[64];
-            swprintf_s(buf, L"共 %d 个歌单", (int)d->p.size());
-            if(self->lblCnt_) self->lblCnt_->SetValueAsObject(AIMPUI_LABEL_PROPID_TEXT, self->MakeStr(buf));
-            if(self->st_) self->st_->SetValueAsObject(AIMPUI_LABEL_PROPID_TEXT, self->MakeStr(L"歌单加载完成，勾选后点“应用”保存"));
-            self->SaveConfig(false);
-            self->loading_ = false;
-            // 上一步 SaveConfig 在 loading_=true 时被跳过, 这里补一次落盘恢复的勾选状态
-            self->SaveConfig(false);
-        }
-        if(d) delete d;
-        return 0;
-    }
-    case WM_USER+5:{
-        // 同步完成: 主线程导入 m3u8 到播放列表「网易云串流」(复用同名, 避免重复新建)
-        std::wstring* p=(std::wstring*)lParam;
-        int total=(int)wParam;
-        if(p && self->core_ && IsWindow(hWnd)){
-            if(self->st_) self->st_->SetValueAsObject(AIMPUI_LABEL_PROPID_TEXT, self->MakeStr(L"正在导入播放列表..."));
-            // 服务对象必须用 QueryInterface 获取(CreateObject 拿不到服务, 会静默失败)
-            IAIMPServicePlaylistManager* pm=nullptr;
-            if( SUCCEEDED(self->core_->QueryInterface(IID_IAIMPServicePlaylistManager, (void**)&pm))
-             || SUCCEEDED(self->core_->CreateObject(IID_IAIMPServicePlaylistManager, (void**)&pm)) ){
-                if(pm){
-                    IAIMPString* name=self->MakeStr(L"网易云串流");
-                    IAIMPPlaylist* pl=nullptr;
-                    if(name){
-                        if(FAILED(pm->GetLoadedPlaylistByName(name, &pl)) || !pl)
-                            pm->CreatePlaylist(name, TRUE, &pl);
-                    }
-                    if(pl){
-                        IAIMPString* path=self->MakeStr(p->c_str());
-                        HRESULT hrAdd=E_FAIL;
-                        if(path){
-                            pl->BeginUpdate();
-                            pl->DeleteAll();
-                            hrAdd = pl->Add(path, 0, -1);
-                            pl->EndUpdate();
-                            path->Release();
-                        }
-                        wchar_t b[128];
-                        if(SUCCEEDED(hrAdd)) swprintf_s(b, L"已同步 %d 首到播放列表「网易云串流」(本地代理, 播放时实时取链)", total);
-                        else swprintf_s(b, L"同步失败 (Add 0x%08X)", (unsigned)hrAdd);
-                        if(self->st_) self->st_->SetValueAsObject(AIMPUI_LABEL_PROPID_TEXT, self->MakeStr(b));
-                    } else {
-                        if(self->st_) self->st_->SetValueAsObject(AIMPUI_LABEL_PROPID_TEXT, self->MakeStr(L"无法创建/找到播放列表"));
-                    }
-                    if(name) name->Release();
-                    if(pl) pl->Release();
-                }
-            } else {
-                if(self->st_) self->st_->SetValueAsObject(AIMPUI_LABEL_PROPID_TEXT, self->MakeStr(L"获取 PlaylistManager 服务失败"));
-            }
-            if(pm) pm->Release();
-        }
-        delete p;
-        return 0;
-    }
-    case WM_NCDESTROY:
-        // 还原窗口过程(自有消息窗口销毁时)
-        if(self){
-            if(prev) SetWindowLongPtrW(hWnd, GWLP_WNDPROC, (LONG_PTR)prev);
-            SetWindowLongPtrW(hWnd, GWLP_USERDATA, 0);
-            self->notifPrevProc_ = nullptr;
-            prev = nullptr;
-        }
-        break;
-    }
-    return prev ? CallWindowProcW(prev,hWnd,msg,wParam,lParam) : DefWindowProcW(hWnd,msg,wParam,lParam);
-}
+// L4: 原 FrameWndProc(WM_USER+2/3/5 主线程通知处理)已随"隐藏消息窗口"通知通道
+//     一并移除 —— v1.5 起后台任务经 ProgCtx + 进度对话框直接回传, 无任何 PostMessage 发送方;
+//     与 WM_USER+5 重复的播放列表导入实现也已删除(StartSync 直调 ImportPlaylist)。

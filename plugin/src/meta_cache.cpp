@@ -79,29 +79,44 @@ bool HttpDownloadBytes(const std::wstring& url, std::string& out){
     bool ok = false;
     if(con){
         bool https = uc.nScheme == INTERNET_SCHEME_HTTPS;
-        req = WinHttpOpenRequest(con, L"GET", uc.lpszUrlPath, nullptr,
-                                 WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                 https ? WINHTTP_FLAG_SECURE : 0);
+        // M2: 默认严格 TLS 证书校验; 证书异常(自签镜像/个别 CDN 链)记日志后仅放宽重试一次
+        for(int relax = 0; relax < 2; ++relax){
+            req = WinHttpOpenRequest(con, L"GET", uc.lpszUrlPath, nullptr,
+                                     WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                     https ? WINHTTP_FLAG_SECURE : 0);
+            if(!req) break;
+            if(relax){
+                FsLog("HttpDownloadBytes: TLS cert check failed, retry once with relaxed flags");
+                DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                                 SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+                WinHttpSetOption(req, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
+            }
+            if(WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                  WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+               WinHttpReceiveResponse(req, nullptr))
+                break;
+            DWORD err = GetLastError();
+            WinHttpCloseHandle(req); req = nullptr;
+            bool tlsErr = (err == ERROR_WINHTTP_SECURE_FAILURE ||
+                           err == ERROR_WINHTTP_SECURE_CERT_CN_INVALID ||
+                           err == ERROR_WINHTTP_SECURE_CERT_DATE_INVALID ||
+                           err == ERROR_WINHTTP_SECURE_INVALID_CA ||
+                           err == ERROR_WINHTTP_SECURE_INVALID_CERT);
+            if(!tlsErr || relax == 1) break;
+        }
         if(req){
-            DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
-                             SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
-            WinHttpSetOption(req, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
-            if(SUCCEEDED(WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) &&
-               WinHttpReceiveResponse(req, nullptr)){
-                DWORD status = 0, statusLen = sizeof(status);
-                if(WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                                       nullptr, &status, &statusLen, nullptr))
-                    NcmErrorNotifyAccess((int)status);
-                for(;;){
-                    DWORD avail = 0;
-                    if(!WinHttpQueryDataAvailable(req, &avail) || avail == 0) { ok = true; break; }
-                    size_t before = out.size();
-                    out.resize(before + avail);
-                    DWORD got = 0;
-                    if(!WinHttpReadData(req, out.data() + before, avail, &got)){ ok = false; break; }
-                    out.resize(before + got);
-                }
+            DWORD status = 0, statusLen = sizeof(status);
+            if(WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                   nullptr, &status, &statusLen, nullptr))
+                NcmErrorNotifyAccess((int)status);
+            for(;;){
+                DWORD avail = 0;
+                if(!WinHttpQueryDataAvailable(req, &avail) || avail == 0) { ok = true; break; }
+                size_t before = out.size();
+                out.resize(before + avail);
+                DWORD got = 0;
+                if(!WinHttpReadData(req, out.data() + before, avail, &got)){ ok = false; break; }
+                out.resize(before + got);
             }
             WinHttpCloseHandle(req);
         }
@@ -140,7 +155,9 @@ unsigned __int64 FileMTime(const std::wstring& path){
 // 调用方需持有 g_metaMtx
 void LoadMetaFile(){
     g_meta.byPid.clear();
-    std::ifstream f(WideToUtf8(MetaCachePath()));
+    // H3: 宽字符路径构造 fstream(MSVC 扩展重载); 旧实现 WideToUtf8 后按 ACP 解码,
+    //     中文用户名的 TEMP 路径必然打开失败 → 元数据缓存失效
+    std::ifstream f(MetaCachePath().c_str());
     if(!f) return;
     try{
         json j; f >> j;
@@ -181,7 +198,8 @@ void SaveMetaFile(){
     // D4: 原子写(临时文件 + 替换), 避免多进程/多线程读到半截 JSON
     std::wstring path = MetaCachePath();
     std::wstring tmp = path + L".tmp";
-    std::ofstream f(WideToUtf8(tmp), std::ios::trunc);
+    // H3: 同 LoadMetaFile, 宽字符路径打开
+    std::ofstream f(tmp.c_str(), std::ios::trunc);
     if(f){
         f << j.dump();
         f.close();
@@ -324,6 +342,9 @@ bool LookupByTid(long long tid, NcmSong& out){
 
 void Upsert(long long pid, const NcmSong& song){
     std::lock_guard<std::mutex> lk(g_metaMtx);
+    // M3: 与 WritePlaylist 对齐, 先吸收外部(GUI/同步线程)对缓存文件的修改再落盘,
+    //     否则会用本进程的旧内存快照整份覆盖, 丢掉同步刚写入的歌单条目
+    ReloadMetaIfChanged();
     g_meta.byPid[pid][song.id] = song;
     SaveMetaFile();
 }

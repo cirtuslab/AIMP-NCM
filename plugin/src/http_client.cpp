@@ -3,6 +3,8 @@
 #include "error_notify.h"
 #include <sstream>
 
+void FsLog(const char* what);   // filesystem.cpp; M2 证书放宽时记日志
+
 bool HttpClient::CrackUrl(const std::wstring& url, std::wstring& host, INTERNET_PORT& port, std::wstring& path, bool& https) {
     URL_COMPONENTS uc={}; uc.dwStructSize=sizeof(uc);
     WCHAR h[256]={0}, p[2048]={0};
@@ -29,8 +31,18 @@ HttpResponse HttpClient::Request(const std::wstring& method, const std::wstring&
     HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), port, 0);
     if (!hConnect) { WinHttpCloseHandle(hSession); return resp; }
     DWORD flags = https ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET hReq = WinHttpOpenRequest(hConnect, method.c_str(), path.c_str(), nullptr, nullptr, nullptr, flags);
-    if (!hReq) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return resp; }
+    HINTERNET hReq = nullptr;   // M2: 在放宽重试循环中按需创建
+    // M2: 默认严格 TLS 证书校验; 证书异常(自签 https 镜像等)记日志后仅放宽重试一次,
+    //     不再对全部请求无条件免检(直连 music.163.com 的请求携带登录态, 可被中间人截获)
+    BOOL ok = FALSE;
+    for (int relax = 0; relax < 2; ++relax) {
+        hReq = WinHttpOpenRequest(hConnect, method.c_str(), path.c_str(), nullptr, nullptr, nullptr, flags);
+        if (!hReq) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return resp; }
+        if (relax) {
+            FsLog("HttpClient: TLS cert check failed, retry once with relaxed flags");
+            DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA|SECURITY_FLAG_IGNORE_CERT_CN_INVALID|SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+            WinHttpSetOption(hReq, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
+        }
     // 自动解压 gzip/deflate（网易云 weapi/eapi 响应默认 gzip 压缩，
     // 不解压则 body 是二进制乱码，JSON 解析必然失败）
 #ifdef WINHTTP_OPTION_DECOMPRESSION
@@ -51,10 +63,6 @@ HttpResponse HttpClient::Request(const std::wstring& method, const std::wstring&
         hdr += L"Cookie: " + cookie;
     }
     if (!hdr.empty()) WinHttpAddRequestHeaders(hReq, hdr.c_str(), (ULONG)-1, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-    // ignore cert errors for simplicity
-    DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA|SECURITY_FLAG_IGNORE_CERT_CN_INVALID|SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
-    WinHttpSetOption(hReq, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
-    BOOL ok = FALSE;
     if (method==L"POST") {
         std::wstring ct = L"Content-Type: application/x-www-form-urlencoded";
         WinHttpAddRequestHeaders(hReq, ct.c_str(), (ULONG)-1, WINHTTP_ADDREQ_FLAG_ADD_IF_NEW);
@@ -62,8 +70,17 @@ HttpResponse HttpClient::Request(const std::wstring& method, const std::wstring&
     } else {
         ok = WinHttpSendRequest(hReq, nullptr, 0, nullptr, 0, 0, 0);
     }
-    if (!ok) { WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return resp; }
-    if (!WinHttpReceiveResponse(hReq, nullptr)) { WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return resp; }
+    if (ok) ok = WinHttpReceiveResponse(hReq, nullptr);
+    if (ok) break;
+    DWORD err = GetLastError();
+    WinHttpCloseHandle(hReq); hReq = nullptr;
+    bool tlsErr = (err == ERROR_WINHTTP_SECURE_FAILURE ||
+                   err == ERROR_WINHTTP_SECURE_CERT_CN_INVALID ||
+                   err == ERROR_WINHTTP_SECURE_CERT_DATE_INVALID ||
+                   err == ERROR_WINHTTP_SECURE_INVALID_CA ||
+                   err == ERROR_WINHTTP_SECURE_INVALID_CERT);
+    if (!tlsErr || relax == 1) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return resp; }
+    }
     DWORD status=0, sz=sizeof(status);
     WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER, nullptr, &status, &sz, nullptr);
     resp.status=(int)status;

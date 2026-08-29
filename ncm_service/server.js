@@ -12,8 +12,8 @@ app.use(express.json())
 app.use(express.urlencoded({extended:true}))
 app.use(cookieParser())
 
-// 允许跨域
-app.use((req,res,next)=>{ res.header('Access-Control-Allow-Origin','*'); res.header('Access-Control-Allow-Headers','*'); next(); })
+// M5: 不提供通配 CORS —— 本镜像按设计只服务本机插件(WinHTTP 客户端, 不受 CORS 约束),
+//     开放跨域会让任意网页(含 DNS rebinding)把本机当作访问网易云的匿名中转
 
 // 通用转发： /song/url/v1?level=exhigh&id=123&cookie=xxx
 app.all('*', async (req,res)=>{

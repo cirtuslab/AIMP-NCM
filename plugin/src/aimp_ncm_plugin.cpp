@@ -22,7 +22,7 @@ PWCHAR AimpNcmPlugin::InfoGet(int Index){
     switch(Index){
     case AIMP_PLUGIN_INFO_NAME: return (PWCHAR)L"AIMP NCM 网易云串流";
     case AIMP_PLUGIN_INFO_AUTHOR: return (PWCHAR)L"cirtuslab / YuzuBD";
-    case AIMP_PLUGIN_INFO_SHORT_DESCRIPTION: return (PWCHAR)L"串流网易云歌单到 AIMP 播放列表 [v1.5.0]";
+    case AIMP_PLUGIN_INFO_SHORT_DESCRIPTION: return (PWCHAR)L"串流网易云歌单到 AIMP 播放列表 [v1.5.1]";
     case AIMP_PLUGIN_INFO_FULL_DESCRIPTION: return (PWCHAR)L"支持 Cookie 登录、音质选择、歌单同步、歌曲信息与封面显示，基于 NeteaseCloudMusicApi";
     default: return nullptr;
     }
@@ -47,8 +47,9 @@ HRESULT AimpNcmPlugin::Initialize(IAIMPCore* Core){
           sprintf_s(b, "RegisterExtension FS hr1=0x%08X FileInfo hr2=0x%08X", (unsigned)hr1, (unsigned)hr2);
           FsLog(b); }
     } catch(...){ fs_=nullptr; }
-    // 启动本地重定向服务: 播放列表使用 http://127.0.0.1:{port}/pid/tid.mp3 条目,
-    // 播放时本插件实时解析真实链接并 302 重定向 (AIMP 原生支持 http, 规避自定义协议问题)
+    // 启动本地代理服务: 播放列表使用 http://127.0.0.1:{port}/pid/tid 条目,
+    // 播放时本插件实时解析真实 CDN 链接并直接代理拉流(非 302 重定向), 流内注入 ID3v2 标签
+    // (D1: 旧注释仍写"302 重定向", 与实现不符, 已修正)
     try {
         extern void FsLog(const char*);
         NcmConfig cfg; ConfigManager::Load(cfg);

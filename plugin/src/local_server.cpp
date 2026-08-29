@@ -14,6 +14,7 @@
 #include <mutex>
 #include <thread>
 #include <string>
+#include <cstring>
 #include <fstream>
 #include <algorithm>
 #include <set>
@@ -63,9 +64,9 @@ std::wstring CacheDir(){
 }
 
 void CleanupOldCache(){
-    // 策略: cfg.cacheDays<=0 表示永不自动删除; 白名单歌单(pid)的缓存跳过
+    // 策略(L1): cfg.cacheDays<=0 表示永不自动删除(与 config.h 注释对齐, 此前 0 会被当 7 天); 白名单歌单(pid)的缓存跳过
     NcmConfig cfg; ConfigManager::Load(cfg);
-    if(cfg.cacheDays < 0) return;
+    if(cfg.cacheDays <= 0) return;
 
     std::set<long long> whitelist;
     {
@@ -79,8 +80,7 @@ void CleanupOldCache(){
         }
     }
 
-    const ULONGLONG maxAgeMs = (cfg.cacheDays > 0 ? (ULONGLONG)cfg.cacheDays : 7ull)
-                               * 24ull * 3600ull * 1000ull;
+    const ULONGLONG maxAgeMs = (ULONGLONG)cfg.cacheDays * 24ull * 3600ull * 1000ull;
     WIN32_FIND_DATAW fd;
     std::wstring pat = CacheDir() + L"\\*";
     HANDLE h = FindFirstFileW(pat.c_str(), &fd);
@@ -138,6 +138,8 @@ long long ParseRangeStart(const std::string& req);
 
 // serve a local file directly (supports Range); returns whether handled.
 // tag: 可选 ID3v2 前缀标签, 使虚拟流 = tag + 音频(客户端偏移需减去 tagSize 映射到文件)
+// H2: 本函数与 ProxyAndCache 一律不关闭连接 socket, 统一由 HandleClient 的 RAII 收尾,
+//     杜绝"失败路径关闭后调用方继续用/重关"的句柄复用误伤
 bool ServeFile(SOCKET s, const std::wstring& path, const std::wstring& ext, long long reqStart, const std::string* tag){
     HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if(f == INVALID_HANDLE_VALUE) return false;
@@ -152,7 +154,6 @@ bool ServeFile(SOCKET s, const std::wstring& path, const std::wstring& ext, long
                            "Content-Length: 0\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n";
         SendAll(s, head);
         CloseHandle(f);
-        shutdown(s, SD_SEND); closesocket(s);
         return true;
     }
     bool partial = reqStart > 0;
@@ -166,16 +167,16 @@ bool ServeFile(SOCKET s, const std::wstring& path, const std::wstring& ext, long
           "Content-Length: " + std::to_string(sendLen) + "\r\n";
     head += std::string("Content-Type: ") + WideToUtf8(MimeFor(ext)) +
             "\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n";
-    if(!SendAll(s, head)){ CloseHandle(f); shutdown(s, SD_SEND); closesocket(s); return true; }
+    if(!SendAll(s, head)){ CloseHandle(f); return true; }
 
     long long fileOff = reqStart >= tagSize ? reqStart - tagSize : 0;
     if(tag && reqStart < tagSize){
         // 请求落在标签区间: 先发标签的剩余部分, 再发文件开头
         long long tagLen = tagSize - reqStart;
-        if(!SendAll(s, tag->data() + reqStart, (int)tagLen)){ CloseHandle(f); shutdown(s, SD_SEND); closesocket(s); return true; }
+        if(!SendAll(s, tag->data() + reqStart, (int)tagLen)){ CloseHandle(f); return true; }
         sendLen -= tagLen;
     }
-    if(sendLen <= 0){ CloseHandle(f); shutdown(s, SD_SEND); closesocket(s); return true; }
+    if(sendLen <= 0){ CloseHandle(f); return true; }
 
     LARGE_INTEGER pos; pos.QuadPart = fileOff;
     SetFilePointerEx(f, pos, nullptr, FILE_BEGIN);
@@ -188,8 +189,6 @@ bool ServeFile(SOCKET s, const std::wstring& path, const std::wstring& ext, long
         remaining -= got;
     }
     CloseHandle(f);
-    shutdown(s, SD_SEND);
-    closesocket(s);
     return true;
 }
 
@@ -246,21 +245,36 @@ bool HttpOpenGet(const std::wstring& url, HttpGet& g, int* outStatus = nullptr){
     g.con = WinHttpConnect(g.ses, uc.lpszHostName, uc.nPort, 0);
     if(!g.con){ HttpClose(g); return false; }
     bool https = uc.nScheme == INTERNET_SCHEME_HTTPS;
-    g.req = WinHttpOpenRequest(g.con, L"GET", uc.lpszUrlPath, nullptr,
-                               WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                               https ? WINHTTP_FLAG_SECURE : 0);
-    if(!g.req){ HttpClose(g); return false; }
-    DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
-                     SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
-    WinHttpSetOption(g.req, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
-    WinHttpAddRequestHeaders(g.req,
-        L"User-Agent: AIMP-NCM/1.3\r\nReferer: https://music.163.com\r\n",
-        (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+    // M2: 默认严格 TLS 证书校验; 证书异常(自签镜像/个别 CDN 链)记日志后仅放宽重试一次,
+    //     不再对全部请求无条件免检(携带登录态的请求可被中间人截获)
+    for(int relax = 0; relax < 2; ++relax){
+        g.req = WinHttpOpenRequest(g.con, L"GET", uc.lpszUrlPath, nullptr,
+                                   WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                   https ? WINHTTP_FLAG_SECURE : 0);
+        if(!g.req){ HttpClose(g); return false; }
+        if(relax){
+            FsLog("HttpOpenGet: TLS cert check failed, retry once with relaxed flags");
+            DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                             SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+            WinHttpSetOption(g.req, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
+        }
+        WinHttpAddRequestHeaders(g.req,
+            L"User-Agent: AIMP-NCM/1.3\r\nReferer: https://music.163.com\r\n",
+            (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
 
-    if(FAILED(WinHttpSendRequest(g.req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                 WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) ||
-       !WinHttpReceiveResponse(g.req, nullptr)){
-        HttpClose(g); return false;
+        if(WinHttpSendRequest(g.req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                              WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+           WinHttpReceiveResponse(g.req, nullptr))
+            break;
+
+        DWORD err = GetLastError();
+        WinHttpCloseHandle(g.req); g.req = nullptr;
+        bool tlsErr = (err == ERROR_WINHTTP_SECURE_FAILURE ||
+                       err == ERROR_WINHTTP_SECURE_CERT_CN_INVALID ||
+                       err == ERROR_WINHTTP_SECURE_CERT_DATE_INVALID ||
+                       err == ERROR_WINHTTP_SECURE_INVALID_CA ||
+                       err == ERROR_WINHTTP_SECURE_INVALID_CERT);
+        if(!tlsErr || relax == 1){ HttpClose(g); return false; }
     }
     DWORD status = 0, sz = sizeof(status);
     WinHttpQueryHeaders(g.req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
@@ -292,9 +306,11 @@ int HttpRead(HttpGet& g, char* buf, int len){
 // pipe CDN -> socket (only bytes >= contentSkip) while caching full content to disk.
 // tag: 可选 ID3v2 前缀标签, 虚拟流 = tag + CDN 音频(客户端偏移需减去 tagSize 映射)
 // client disconnect mid-way does NOT abort the download: next play hits the cache.
-bool ProxyAndCache(SOCKET s, long long pid, long long tid, const std::wstring& url,
-                   const std::wstring& ext, long long reqStart, const std::string* tag,
-                   std::string* failReason = nullptr){
+// H2: 返回 1=已处理(流已送达/416), 0=可重试失败(连接仍可用), -1=客户端已断开(上层应立即终止
+//     重试且不弹"此曲不可用"); 连接 socket 一律不在此关闭, 由 HandleClient 的 RAII 统一收尾
+int ProxyAndCache(SOCKET s, long long pid, long long tid, const std::wstring& url,
+                  const std::wstring& ext, long long reqStart, const std::string* tag,
+                  std::string* failReason = nullptr){
     HttpGet g;
     int cdnStatus = 0;
     if(!HttpOpenGet(url, g, &cdnStatus)){
@@ -302,7 +318,7 @@ bool ProxyAndCache(SOCKET s, long long pid, long long tid, const std::wstring& u
             char b[64]; sprintf_s(b, "HTTP %d", cdnStatus);
             *failReason = std::string("CDN 连接失败 (") + b + ")";
         }
-        return false;
+        return 0;
     }
 
     long long tagSize = tag ? (long long)tag->size() : 0;
@@ -317,8 +333,7 @@ bool ProxyAndCache(SOCKET s, long long pid, long long tid, const std::wstring& u
                               "Content-Length: 0\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n";
         SendAll(s, head416);
         HttpClose(g);
-        shutdown(s, SD_SEND); closesocket(s);
-        return true;
+        return 1;
     }
 
     // ---- A6: 内容校验(拒绝错误页/非音频响应), 失败不缓存并按"拉流失败"重试 ----
@@ -334,7 +349,7 @@ bool ProxyAndCache(SOCKET s, long long pid, long long tid, const std::wstring& u
     int probeGot = HttpRead(g, probeBuf, (int)sizeof(probeBuf));
     if(probeGot < 0){
         if(failReason) *failReason = "读取 CDN 响应失败";
-        HttpClose(g); return false;
+        HttpClose(g); return 0;
     }
     std::string prefix(probeBuf, probeGot);
     bool magicOk = true;
@@ -353,7 +368,7 @@ bool ProxyAndCache(SOCKET s, long long pid, long long tid, const std::wstring& u
         FsLog(("content check FAIL ct=" + ct + " ext=" + WideToUtf8(ext) +
                " magicOk=" + (magicOk ? "1" : "0")).c_str());
         HttpClose(g);
-        return false;   // 触发上层重试(最多3次), 全部失败后提示"此曲不可用"
+        return 0;       // 触发上层重试(最多3次), 全部失败后提示"此曲不可用"
     }
 
     std::string head;
@@ -368,8 +383,11 @@ bool ProxyAndCache(SOCKET s, long long pid, long long tid, const std::wstring& u
     head += "Accept-Ranges: bytes\r\nContent-Type: " + WideToUtf8(MimeFor(ext)) +
             "\r\nConnection: close\r\n\r\n";
     if(!SendAll(s, head)){
+        // H2: 客户端尚未收到任何响应字节就断开 → 返回"连接已死",
+        //     上层据此终止重试(不再空发 CDN 请求)且不误报"此曲不可用"
         if(failReason) *failReason = "客户端连接中断";
-        HttpClose(g); shutdown(s, SD_SEND); closesocket(s); return false;
+        HttpClose(g);
+        return -1;
     }
 
     bool sendAlive = true;
@@ -440,9 +458,7 @@ bool ProxyAndCache(SOCKET s, long long pid, long long tid, const std::wstring& u
         if(cf.is_open()) cf.close();
         DeleteFileW(partPath.c_str()); // incomplete download: no cache
     }
-    shutdown(s, SD_SEND);
-    closesocket(s);
-    return true;
+    return 1;   // H2: 连接由 HandleClient 的 RAII 统一关闭
 }
 
 long long ParseRangeStart(const std::string& req){
@@ -457,19 +473,52 @@ long long ParseRangeStart(const std::string& req){
     return v;
 }
 
-void HandleClient(SOCKET s){
+// H2: 连接 socket 的 RAII 所有权 —— HandleClient 的所有退出路径(含异常展开)统一
+// shutdown + closesocket, ServeFile/ProxyAndCache 等被调函数不再触碰连接生命周期
+struct ConnCloser {
+    SOCKET s;
+    explicit ConnCloser(SOCKET c): s(c) {}
+    ~ConnCloser(){
+        if(s != INVALID_SOCKET){
+            shutdown(s, SD_SEND);
+            closesocket(s);
+        }
+    }
+};
+
+void HandleClientInner(SOCKET s){
+    // H1: 循环 recv 直到请求头结束(\r\n\r\n)或缓冲区满, 防止 TCP 分段(如只收到 "GE")
+    //     被当成完整请求解析; 加收超时, 防慢速连接长期占用连接线程
+    DWORD rcvTimeout = 15000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvTimeout, sizeof(rcvTimeout));
     char buf[4096] = {0};
-    int n = recv(s, buf, sizeof(buf) - 1, 0);
-    if(n <= 0){ closesocket(s); return; }
+    int n = 0;
+    while(n < (int)sizeof(buf) - 1){
+        int r = recv(s, buf + n, (int)sizeof(buf) - 1 - n, 0);
+        if(r <= 0) return;
+        n += r;
+        buf[n] = 0;
+        if(strstr(buf, "\r\n\r\n")) break;
+    }
     buf[n] = 0;
     std::string req(buf);
 
     // request line: GET /pid/tid.mp3 HTTP/1.1
+    // H1: 仅接受 GET; 非 GET/空路径显式拒绝, 不再让空 path 进入 substr 抛 out_of_range
+    if(req.rfind("GET ", 0) != 0){
+        SendAll(s, "HTTP/1.1 405 Method Not Allowed\r\n"
+                   "Content-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
+    }
     std::string path;
-    if(req.rfind("GET ", 0) == 0){
+    {
         size_t sp = req.find(' ', 4);
         if(sp == std::string::npos) sp = req.find('\r', 4);
         if(sp != std::string::npos) path = req.substr(4, sp - 4);
+    }
+    if(path.empty() || path[0] != '/'){
+        SendAll(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
     }
 
     long long pid = 0, tid = 0;
@@ -488,7 +537,6 @@ void HandleClient(SOCKET s){
     }
     if(pid <= 0 || tid <= 0){
         SendAll(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        shutdown(s, SD_SEND); closesocket(s);
         return;
     }
     long long rangeStart = ParseRangeStart(req);
@@ -532,7 +580,6 @@ void HandleClient(SOCKET s){
         else title = L"tid " + std::to_wstring(tid);
         NcmErrorNotifyTrackUnavailable(tid, title, resolveDetails);
         SendAll(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        shutdown(s, SD_SEND); closesocket(s);
         return;
     }
     std::wstring ext = Utf8ToWide(type.empty() ? "mp3" : type);
@@ -540,32 +587,44 @@ void HandleClient(SOCKET s){
 
     // 3) 拉流: 下载失败不做降级, 同一链接后台重试最多 3 次,
     //    3 次均失败则提示用户"此首不可用"并返回 404
+    //    (H2: 客户端先断开的情况除外 —— 终止重试且不弹"此曲不可用")
     const int kMaxStreamAttempts = 3;
-    bool streamed = false;
+    bool streamed = false, clientGone = false;
     std::wstring streamDetails;   // 逐次拉流失败记录
-    for(int attempt = 1; attempt <= kMaxStreamAttempts && !streamed; ++attempt){
+    for(int attempt = 1; attempt <= kMaxStreamAttempts && !streamed && !clientGone; ++attempt){
         std::string failReason;
-        if(ProxyAndCache(s, pid, tid, Utf8ToWide(url), ext, rangeStart, tag, &failReason)){
+        int r = ProxyAndCache(s, pid, tid, Utf8ToWide(url), ext, rangeStart, tag, &failReason);
+        if(r > 0){
             char b[96];
             sprintf_s(b, "stream tid=%lld OK type=%s", (long long)tid, type.c_str());
             FsLog(b);
             streamed = true;
             break;
         }
+        if(r < 0){ clientGone = true; break; }
         char b[192];
         sprintf_s(b, "stream tid=%lld level=%s attempt=%d FAIL", (long long)tid, usedLevel.c_str(), attempt);
         FsLog(b);
         streamDetails += L"  第 " + std::to_wstring(attempt) + L" 次：" + Utf8ToWide(failReason) + L"\n";
     }
-    if(!streamed){
+    if(!streamed && !clientGone){
         NcmSong song;
         std::wstring title;
         if(NcmMeta::LookupByTid(tid, song) && !song.title.empty()) title = song.title;
         else title = L"tid " + std::to_wstring(tid);
         NcmErrorNotifyTrackUnavailable(tid, title, streamDetails);
         SendAll(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        shutdown(s, SD_SEND); closesocket(s);
-        return;
+    }
+}
+
+void HandleClient(SOCKET s){
+    ConnCloser closer(s);   // H2: RAII 统一收尾连接
+    try{
+        // H1: 任何未预料的解析/内存异常都不允许穿出到 std::thread
+        //     (否则 std::terminate 直接终止整个 AIMP 进程)
+        HandleClientInner(s);
+    }catch(...){
+        try{ FsLog("HandleClient: unexpected exception, connection dropped"); }catch(...){}
     }
 }
 
@@ -575,10 +634,17 @@ void AcceptLoop(){
         if(c == INVALID_SOCKET) break;
         // B2: 连接登记到表, 线程结束后移除; Stop 时 shutdown + 等待
         ConnAdd(c);
-        std::thread([c]{
-            HandleClient(c);
+        try{
+            std::thread([c]{
+                HandleClient(c);
+                ConnRemove(c);
+            }).detach();
+        }catch(...){
+            // H1: 线程资源耗尽时不能泄漏 socket(否则 Stop 的等待永远等不到空表)
             ConnRemove(c);
-        }).detach();
+            shutdown(c, SD_SEND);
+            closesocket(c);
+        }
     }
 }
 
