@@ -123,6 +123,19 @@ def api_song_url(ids, level="exhigh", cookie=""):
     # 使用 eapi 更稳定，此处简化用 weapi 的 enhance/player/url/v1
     return ncm_request("/api/song/enhance/player/url/v1", {"ids":str(ids),"level":level,"encodeType":"flac"}, cookie)
 
+def api_playlist_track_all(pid, limit=1000, offset=0, cookie=""):
+    """与 Node 镜像 /playlist/track/all 对齐: 按 offset/limit 分页返回歌曲"""
+    detail = ncm_request("/api/v6/playlist/detail", {"id": pid, "n": 100000}, cookie)
+    playlist = detail.get("playlist") or detail.get("body",{}).get("playlist") or {}
+    trackIds = playlist.get("trackIds") or []
+    ids = [t["id"] for t in trackIds[offset:offset+limit]]
+    songs = []
+    if ids:
+        c = [{"id": i} for i in ids]
+        song_data = ncm_request("/api/v3/song/detail", {"c": json.dumps(c)}, cookie)
+        songs = song_data.get("songs") or song_data.get("body",{}).get("songs") or []
+    return {"songs": songs, "playlist": playlist}
+
 # ---------- HTTP 服务 ----------
 class Handler(http.server.BaseHTTPRequestHandler):
     def _dispatch(self, q):
@@ -140,6 +153,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 r=api_user_playlist(int(q.get("uid",0)), q.get("cookie",""), int(q.get("limit",30)))
             elif path=="song/url/v1":
                 r=api_song_url(q.get("id",0), q.get("level","exhigh"), q.get("cookie",""))
+            elif path=="playlist/track/all":
+                r=api_playlist_track_all(int(q.get("id",0)), int(q.get("limit",1000)),
+                                         int(q.get("offset",0)), q.get("cookie",""))
+            elif path=="song/detail":
+                r=ncm_request("/api/v3/song/detail", {"c": q.get("c", "[]")}, q.get("cookie",""))
+            elif path=="lyric":
+                r=ncm_request("/api/song/lyric", {"id": int(q.get("id",0)), "lv":1, "tv":1}, q.get("cookie",""))
+            elif path=="user/account":
+                r=ncm_request("/api/nuser/account/get", {}, q.get("cookie",""))
             else:
                 r={"code":404,"msg":"not found: "+path}
             self.wfile.write(json.dumps(r, ensure_ascii=False).encode())
@@ -154,7 +176,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._dispatch(q)
 
     def do_POST(self):
-        # qr_login.py 与 GUI 回退逻辑使用 POST；此前未实现会返回 501
+        # 兼容 POST 调用（扫码/GUI 已移除，保留以兼容旧客户端）
         length = int(self.headers.get("Content-Length","0") or 0)
         raw = self.rfile.read(length).decode("utf-8","ignore") if length else ""
         parsed = urllib.parse.urlparse(self.path)
@@ -223,5 +245,8 @@ if __name__=="__main__":
         print("  GET /login/qr/key")
         print("  GET /login/qr/check?key=xxx")
         print("  GET /user/playlist?uid=xxx")
+        print("  GET /playlist/track/all?id=xxx&limit=1000&offset=0")
+        print("  GET /lyric?id=xxx")
         print("或 python app.py --sync --cookie 'MUSIC_U=xxx' 自动生成 m3u8")
-        http.server.HTTPServer(("0.0.0.0",args.port), Handler).serve_forever()
+        # 仅监听回环地址: 镜像服务按设计接受 cookie 参数, 不应暴露到局域网/公网
+        http.server.HTTPServer(("127.0.0.1",args.port), Handler).serve_forever()

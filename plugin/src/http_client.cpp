@@ -1,5 +1,6 @@
 #include "http_client.h"
 #include "utils.h"
+#include "error_notify.h"
 #include <sstream>
 
 bool HttpClient::CrackUrl(const std::wstring& url, std::wstring& host, INTERNET_PORT& port, std::wstring& path, bool& https) {
@@ -66,6 +67,8 @@ HttpResponse HttpClient::Request(const std::wstring& method, const std::wstring&
     DWORD status=0, sz=sizeof(status);
     WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER, nullptr, &status, &sz, nullptr);
     resp.status=(int)status;
+    // 访问受限(403/429 等)统一弹窗警告(带冷却, 见 error_notify.cpp)
+    NcmErrorNotifyAccess(resp.status);
     DWORD hdrLen=0; WinHttpQueryHeaders(hReq, WINHTTP_QUERY_RAW_HEADERS_CRLF, nullptr, nullptr, &hdrLen, nullptr);
     if (hdrLen) { std::wstring h(hdrLen/2,0); WinHttpQueryHeaders(hReq, WINHTTP_QUERY_RAW_HEADERS_CRLF, nullptr, h.data(), &hdrLen, nullptr); resp.headers=h; }
     // 解析 Set-Cookie（登录态 MUSIC_U 等从这里拿）

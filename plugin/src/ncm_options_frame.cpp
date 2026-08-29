@@ -3,10 +3,10 @@
 #include "utils.h"
 #include "ncm_client.h"
 #include "http_client.h"
-#include "ncm_login_form.h"
 #include "local_server.h"
 #include "filesystem.h"
 #include "meta_cache.h"
+#include "task_center.h"
 #include "../third_party/aimp_sdk/apiGUI.h"
 #include "../third_party/aimp_sdk/apiOptions.h"
 #include "../third_party/aimp_sdk/apiObjects.h"
@@ -16,7 +16,9 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 #include <fstream>
+#include <mutex>
 
 // =============================================================
 // NcmOptionsFrame - AIMP 原生 UI 选项页
@@ -42,6 +44,133 @@ namespace {
         void WINAPI OnChanged(IUnknown*) override { if(self && handler) handler(self); }
         volatile LONG ref = 1;
     };
+
+    // TreeList 专用事件: 复选框勾选走 IAIMPUITreeListEvents::OnNodeChecked,
+    // 仅注册 IAIMPUIChangeEvents::OnChanged 时勾选不会回调,
+    // 导致"拉取歌单后勾选无法点亮应用按钮"。此处同时实现两类事件。
+    struct TreeEvents : public IAIMPUITreeListEvents, public IAIMPUIChangeEvents {
+        NcmOptionsFrame* self = nullptr;
+        void (*handler)(NcmOptionsFrame*) = nullptr;
+        TreeEvents(NcmOptionsFrame* s, void (*h)(NcmOptionsFrame*)) : self(s), handler(h) {}
+        HRESULT WINAPI QueryInterface(REFIID riid, void** ppv) override {
+            if(!ppv) return E_POINTER;
+            if(IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_IAIMPUITreeListEvents))
+                *ppv = static_cast<IAIMPUITreeListEvents*>(this);
+            else if(IsEqualIID(riid, IID_IAIMPUIChangeEvents))
+                *ppv = static_cast<IAIMPUIChangeEvents*>(this);
+            else { *ppv = nullptr; return E_NOINTERFACE; }
+            AddRef(); return S_OK;
+        }
+        ULONG WINAPI AddRef() override { return InterlockedIncrement(&ref); }
+        ULONG WINAPI Release() override { LONG r = InterlockedDecrement(&ref); if(r==0) delete this; return r; }
+        void WINAPI OnChanged(IUnknown*) override { if(self && handler) handler(self); }
+        void WINAPI OnColumnClick(IAIMPUITreeList*, int) override {}
+        void WINAPI OnFocusedColumnChanged(IAIMPUITreeList*) override {}
+        void WINAPI OnFocusedNodeChanged(IAIMPUITreeList*) override {}
+        void WINAPI OnNodeChecked(IAIMPUITreeList*, IAIMPUITreeListNode*) override { if(self && handler) handler(self); }
+        void WINAPI OnNodeDblClicked(IAIMPUITreeList*, IAIMPUITreeListNode*) override {}
+        void WINAPI OnSelectionChanged(IAIMPUITreeList*) override {}
+        void WINAPI OnSorted(IAIMPUITreeList*) override {}
+        void WINAPI OnStructChanged(IAIMPUITreeList*) override {}
+        volatile LONG ref = 1;
+    };
+
+    // ---- B1: AIMP 皮肤进度对话框上下文 ----
+    struct ProgCtx {
+        HANDLE done = nullptr;      // worker 结束后置位
+        HANDLE progress = nullptr;  // 有进度更新
+        std::mutex mtx;
+        INT64 progPos = 0, progTotal = 0;
+        std::wstring progText;
+        std::atomic<bool> cancel{false};
+        int resultCode = 0;         // 0=ok, 1=错误, 2=取消
+        std::wstring resultMsg;
+        // StartSync 结果
+        std::wstring m3uPath; int total = 0; int failed = 0;
+        // RefreshPlaylists 结果
+        std::vector<NcmPlaylist> playlists;
+    };
+
+    void ProgSet(ProgCtx* ctx, INT64 pos, INT64 total, const std::wstring& text){
+        {
+            std::lock_guard<std::mutex> lk(ctx->mtx);
+            ctx->progPos = pos; ctx->progTotal = total; ctx->progText = text;
+        }
+        SetEvent(ctx->progress);
+    }
+
+    struct ProgressEvents : public IAIMPUIProgressDialogEvents {
+        ProgCtx* ctx = nullptr;
+        explicit ProgressEvents(ProgCtx* c) : ctx(c) {}
+        HRESULT WINAPI QueryInterface(REFIID riid, void** ppv) override {
+            if(!ppv) return E_POINTER;
+            if(IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_IAIMPUIProgressDialogEvents)){
+                *ppv = static_cast<IAIMPUIProgressDialogEvents*>(this); AddRef(); return S_OK;
+            }
+            *ppv = nullptr; return E_NOINTERFACE;
+        }
+        ULONG WINAPI AddRef() override { return InterlockedIncrement(&ref); }
+        ULONG WINAPI Release() override { LONG r = InterlockedDecrement(&ref); if(r==0) delete this; return r; }
+        void WINAPI OnCanceled() override { if(ctx) ctx->cancel.store(true); }
+        volatile LONG ref = 1;
+    };
+
+    // 显示 AIMP 皮肤进度对话框并泵消息等待 worker 结束(仅主线程调用)
+    void RunProgressDialog(NcmOptionsFrame* self, IAIMPCore* core, ProgCtx* ctx){
+        const ULONGLONG kMinShowMs = 2500;   // 最短显示时间: 快速任务(<2.5s)也不闪一下
+        IAIMPServiceUI* uiSvc = nullptr;
+        if(!core || FAILED(core->QueryInterface(IID_IAIMPServiceUI, (void**)&uiSvc)) || !uiSvc){
+            WaitForSingleObject(ctx->done, 60000);   // 无 UI 服务: 退化为直接等待
+            return;
+        }
+        ProgressEvents* ev = new ProgressEvents(ctx);
+        IAIMPUIProgressDialog* dlg = nullptr;
+        HRESULT hr = uiSvc->CreateObject(nullptr, ev, IID_IAIMPUIProgressDialog, (void**)&dlg);
+        ev->Release();   // AIMP 持有引用
+        if(FAILED(hr) || !dlg){
+            uiSvc->Release();
+            WaitForSingleObject(ctx->done, 60000);
+            return;
+        }
+        dlg->SetValueAsObject(AIMPUI_PROGRESSDLG_PROPID_CAPTION, self->MakeStr(L"AIMP NCM"));
+        dlg->SetValueAsObject(AIMPUI_PROGRESSDLG_PROPID_MESSAGE, self->MakeStr(L"正在执行，请稍候..."));
+        dlg->SetValueAsInt32(AIMPUI_PROGRESSDLG_PROPID_SHOW_PROGRESS_ON_TASKBAR, 1);
+        dlg->Started();
+        ULONGLONG showStart = GetTickCount64();
+        for(;;){
+            ULONGLONG elapsed = GetTickCount64() - showStart;
+            ULONGLONG remaining = elapsed >= kMinShowMs ? 0 : kMinShowMs - elapsed;
+            HANDLE h[2] = { ctx->done, ctx->progress };
+            DWORD r = MsgWaitForMultipleObjects(2, h, FALSE,
+                                                remaining ? (DWORD)remaining : INFINITE,
+                                                QS_ALLINPUT);
+            if(r == WAIT_OBJECT_0){
+                // worker 完成: 取消时立即关; 否则等满最短显示时间再自动关闭
+                if(ctx->cancel.load() || remaining == 0) break;
+                continue;
+            }
+            if(r == WAIT_TIMEOUT) continue;                     // 最短显示时间已到, 继续等 done
+            if(r == WAIT_OBJECT_0 + 1){
+                std::wstring text; INT64 pos = 0, total = 0;
+                {
+                    std::lock_guard<std::mutex> lk(ctx->mtx);
+                    pos = ctx->progPos; total = ctx->progTotal; text = ctx->progText;
+                }
+                IAIMPString* ts = self->MakeStr(text.c_str());
+                dlg->Progress(pos, total, ts);                  // 主线程调用
+                if(ts) ts->Release();
+            }
+            // 泵消息: 让 AIMP 处理进度对话框的取消事件等
+            MSG m;
+            while(PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)){
+                TranslateMessage(&m);
+                DispatchMessageW(&m);
+            }
+        }
+        dlg->Finished();
+        dlg->Release();
+        uiSvc->Release();
+    }
 }
 
 NcmOptionsFrame::NcmOptionsFrame(IAIMPCore* core): core_(core) {
@@ -191,7 +320,7 @@ void NcmOptionsFrame::OnTestClicked(NcmOptionsFrame* self){ self->TestConnection
 // 歌单树勾选变化: 持久化 + 点亮 AIMP 的"应用"按钮
 void NcmOptionsFrame::OnTreeChanged(NcmOptionsFrame* self){
     if(self->loading_) return;
-    self->SaveConfig(false);
+    // D6: 勾选不再即时写盘, 只标记"已修改"点亮应用; 点「应用」时统一保存
     if(self->optSvc_) self->optSvc_->FrameModified(self);
     // 更新已选计数
     if(self->lblCnt_){
@@ -199,13 +328,6 @@ void NcmOptionsFrame::OnTreeChanged(NcmOptionsFrame* self){
         wchar_t buf[64];
         swprintf_s(buf, L"已选 %zu 个", c.selectedPlaylists.size());
         self->lblCnt_->SetValueAsObject(AIMPUI_LABEL_PROPID_TEXT, self->MakeStr(buf));
-    }
-}
-void NcmOptionsFrame::OnQrClicked(NcmOptionsFrame* self){
-    if(self->form_ && self->core_){
-        HWND h = ((IAIMPUIWinControl*)self->form_)->GetHandle();
-        NcmLoginForm::Show(h, self->core_);
-        self->LoadConfig(); // 登录后刷新状态
     }
 }
 void NcmOptionsFrame::OnRefreshClicked(NcmOptionsFrame* self){ self->RefreshPlaylists(); }
@@ -288,7 +410,7 @@ HWND NcmOptionsFrame::CreateFrame(HWND ParentWnd){
             if(btnTest_) PlaceLeft(btnTest_, 56, 22, 8, 1);
         }
 
-        // ---- 行3: Cookie + 二维码登录 ----
+        // ---- 行3: Cookie 直填 ----
         IAIMPUIWinControl* rowCookie = MakeRow(grpConn, L"rowCookie", 24, 8, 420);
         if(rowCookie){
             IAIMPUIWinControl* lblCookie = MakeLabel(rowCookie, L"lblCookie", L"Cookie:", 62, 20, 0, 2);
@@ -300,12 +422,10 @@ HWND NcmOptionsFrame::CreateFrame(HWND ParentWnd){
                 ev->Release();
                 if(SUCCEEDED(hr) && eCookie_){
                     eCookie_->SetValueAsObject(AIMPUI_EDIT_PROPID_PASSWORDCHAR, MakeStr(L"●"));
-                    eCookie_->SetValueAsObject(AIMPUI_EDIT_PROPID_TEXTHINT, MakeStr(L"扫码后自动填入，或粘贴 MUSIC_U=..."));
+                    eCookie_->SetValueAsObject(AIMPUI_EDIT_PROPID_TEXTHINT, MakeStr(L"粘贴 MUSIC_U=... (只粘值也会自动补键名)"));
                     PlaceLeft(eCookie_, 250, 22, 8, 1);
                 }
             }
-            btnQr_ = CreateBtn(rowCookie, L"btnQr", L"二维码登录", ualLeft, 0,0, 92,22, OnQrClicked);
-            if(btnQr_) PlaceLeft(btnQr_, 92, 22, 8, 1);
         }
 
         // ---- 行4: 状态 ----
@@ -389,6 +509,29 @@ HWND NcmOptionsFrame::CreateFrame(HWND ParentWnd){
                 }
             }
 
+            // ---- 行1.6: 歌词注入模式 ----
+            IAIMPUIWinControl* rowLyric = MakeRow(body2, L"rowLyric", 24, 8, 420);
+            if(rowLyric){
+                MakeLabel(rowLyric, L"lblLyric", L"歌词注入:", 62, 20, 0, 2);
+                {
+                    CtlEvents* ev = new CtlEvents(this, OnLyricChanged);
+                    IAIMPString* nm = MakeStr(L"cboLyric");
+                    hr = uiSvc_->CreateControl(form_, rowLyric, nm, (IUnknown*)ev, IID_IAIMPUIComboBox, (void**)&cboLyric_);
+                    if(nm) nm->Release();
+                    ev->Release();
+                    if(SUCCEEDED(hr) && cboLyric_){
+                        IAIMPUIBaseComboBox* cb=(IAIMPUIBaseComboBox*)cboLyric_;
+                        const wchar_t* items[]={L"不注入",L"USLT(内嵌歌词)"};
+                        for(int i=0;i<2;i++){
+                            IAIMPString* s=MakeStr(items[i]);
+                            if(s){ cb->Add(s, 0); s->Release(); }
+                        }
+                        PlaceLeft(cboLyric_, 150, 22, 8, 1);
+                    }
+                }
+                MakeLabel(rowLyric, L"hintLyric", L"USLT 已验证支持 mp3/flac/wav；首次播放拉取后缓存", 300, 18, 12, 3);
+            }
+
             // ---- 行2: 歌单标题 + 计数 ----
             IAIMPUIWinControl* rowTitle = MakeRow(body2, L"rowTitle", 20, 8, 420);
             if(rowTitle){
@@ -399,9 +542,13 @@ HWND NcmOptionsFrame::CreateFrame(HWND ParentWnd){
             // ---- 行3: 歌单 TreeList（占满剩余空间） ----
             {
                 // 挂接勾选变化事件: 点亮"应用"并即时保存
-                CtlEvents* ev = new CtlEvents(this, OnTreeChanged);
+                // 必须用 TreeEvents(含 OnNodeChecked), 仅 OnChanged 无法感知复选框
+                TreeEvents* ev = new TreeEvents(this, OnTreeChanged);
                 IAIMPString* nm = MakeStr(L"lstPlaylists");
-                hr = uiSvc_->CreateControl(form_, body2, nm, (IUnknown*)ev, IID_IAIMPUITreeList, (void**)&lst_);
+                // TreeEvents 多继承两个事件接口, 到 IUnknown 需先显式走一个基类
+                hr = uiSvc_->CreateControl(form_, body2, nm,
+                                           (IUnknown*)(IAIMPUITreeListEvents*)ev,
+                                           IID_IAIMPUITreeList, (void**)&lst_);
                 if(nm) nm->Release();
                 ev->Release();
                 if(SUCCEEDED(hr) && lst_){
@@ -447,7 +594,6 @@ void NcmOptionsFrame::DestroyFrame(){
     if(eApi_){ eApi_->Release(); eApi_=nullptr; }
     if(btnTest_){ btnTest_->Release(); btnTest_=nullptr; }
     if(eCookie_){ eCookie_->Release(); eCookie_=nullptr; }
-    if(btnQr_){ btnQr_->Release(); btnQr_=nullptr; }
     if(st_){ st_->Release(); st_=nullptr; }
     if(cbo_){ cbo_->Release(); cbo_=nullptr; }
     if(btnRefresh_){ btnRefresh_->Release(); btnRefresh_=nullptr; }
@@ -455,16 +601,17 @@ void NcmOptionsFrame::DestroyFrame(){
     if(lst_){ lst_->Release(); lst_=nullptr; }
     if(cboCache_){ cboCache_->Release(); cboCache_=nullptr; }
     if(eCacheWL_){ eCacheWL_->Release(); eCacheWL_=nullptr; }
+    if(cboLyric_){ cboLyric_->Release(); cboLyric_=nullptr; }
     if(form_){ ((IUnknown*)form_)->Release(); form_=nullptr; }
 }
 
 void NcmOptionsFrame::Notification(int ID){
-    if(ID==0x3){
-        SaveConfig(false);
+    if(ID==NotifyApply){
+        SaveConfig(true);   // 应用前先落盘勾选状态
         StartSync();
         LocalServer::RunCleanupNow();  // 应用后按新缓存策略立即执行一次清理
     }
-    else if(ID==0x1) LoadConfig();
+    else if(ID==NotifyRefresh) LoadConfig();
 }
 
 // ---------- 应用后同步: 勾选歌单 -> 懒加载 m3u8 -> AIMP 播放列表 ----------
@@ -473,57 +620,164 @@ void NcmOptionsFrame::StartSync(){
     if(!form_) return;
     NcmConfig cfg; ConfigManager::Load(cfg);
     if(cfg.selectedPlaylists.empty()){
-        if(st_) st_->SetValueAsObject(AIMPUI_LABEL_PROPID_TEXT, MakeStr(L"未勾选任何歌单，跳过同步"));
+        ShowStatus(L"未勾选任何歌单，跳过同步");
         return;
     }
-    if(st_) st_->SetValueAsObject(AIMPUI_LABEL_PROPID_TEXT, MakeStr(L"正在生成播放列表..."));
-    HWND hNotif = NotifWnd();
-    std::thread([this, hNotif]{
+    ShowStatus(L"正在生成播放列表...");
+
+    ProgCtx* ctx = new ProgCtx();
+    ctx->done     = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ctx->progress = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+    // B1: 后台任务由插件跟踪(不捕获 this), 只通过 ctx/对话框通信;
+    // AIMP 进度对话框期间设置页不可关闭, 杜绝"关页丢结果"
+    TaskCenter::Run([ctx]{
         try{
-        NcmConfig c; ConfigManager::Load(c);
-        NcmClient client(c);
-        WCHAR tmp[MAX_PATH]={0}; GetTempPathW(MAX_PATH, tmp);
-        std::wstring dir = std::wstring(tmp) + L"aimp_ncm";
-        CreateDirectoryW(dir.c_str(), nullptr);
-        std::wstring m3u = dir + L"\\ncm_playlist.m3u8";
-        // 懒加载 ncm:// 条目: 生成秒级完成, 播放时由插件文件系统实时取链
-        std::ofstream f(m3u.c_str());
-        if(!f){
-            PostMessageW(hNotif, WM_USER+2, 0, (LPARAM)new std::wstring(L"无法创建临时 m3u8 文件"));
-            return;
+            NcmConfig c; ConfigManager::Load(c);
+            NcmClient client(c);
+            WCHAR tmp[MAX_PATH]={0}; GetTempPathW(MAX_PATH, tmp);
+            std::wstring dir = std::wstring(tmp) + L"aimp_ncm";
+            CreateDirectoryW(dir.c_str(), nullptr);
+            std::wstring m3u = dir + L"\\ncm_playlist.m3u8";
+            std::ofstream f(m3u.c_str());
+            if(!f){
+                ctx->resultCode = 1; ctx->resultMsg = L"无法创建临时 m3u8 文件";
+                SetEvent(ctx->done); return;
+            }
+            f << "#EXTM3U\n";
+            // D6: 缓冲写 m3u8, 减少逐行磁盘 IO
+            std::string m3uBuf;
+            auto flushM3u = [&](){
+                if(!m3uBuf.empty()){ f << m3uBuf; f.flush(); m3uBuf.clear(); }
+            };
+            int port = c.localPort > 0 ? c.localPort : 47777;
+            std::string base = "http://127.0.0.1:" + std::to_string(port) + "/";
+            int total=0, failed=0, plIdx=0, plCount=(int)c.selectedPlaylists.size();
+            for(auto pid : c.selectedPlaylists){
+                if(ctx->cancel.load() || TaskCenter::IsShuttingDown()){ ctx->resultCode = 2; break; }
+                plIdx++;
+                ProgSet(ctx, plIdx, plCount,
+                        L"正在获取歌单 " + std::to_wstring(plIdx) + L"/" + std::to_wstring(plCount) + L" ...");
+                std::vector<NcmSong> songs; NcmPlaylist info;
+                if(!client.GetPlaylistDetail(pid, songs, &info) || songs.empty()){ failed++; continue; }
+                NcmMeta::WritePlaylist(pid, songs);
+                for(auto& s : songs){
+                    m3uBuf += "#EXTINF:" + std::to_string(s.durationMs/1000) + "," +
+                              WideToUtf8(s.artist) + " - " + WideToUtf8(s.title) + "\n";
+                    m3uBuf += base + std::to_string(pid) + "/" + std::to_string(s.id) + "\n";
+                    total++;
+                    if(m3uBuf.size() >= 64*1024) flushM3u();
+                }
+            }
+            flushM3u();
+            f.close();
+            if(ctx->resultCode != 2){
+                if(total == 0){
+                    wchar_t b[128];
+                    swprintf_s(b, L"未获取到歌曲(失败 %d 个歌单) · 请检查登录状态/网络后重试", failed);
+                    ctx->resultCode = 1; ctx->resultMsg = b;
+                } else {
+                    ctx->resultCode = 0; ctx->m3uPath = m3u; ctx->total = total; ctx->failed = failed;
+                }
+            }
+        }catch(...){
+            ctx->resultCode = 1; ctx->resultMsg = L"同步线程发生异常";
+            FsLog("StartSync worker exception");
         }
-        f << "#EXTM3U\n";
-        // 本地重定向条目: AIMP 原生支持 http, 播放时本地服务实时解析真实链接
-        int port = c.localPort > 0 ? c.localPort : 47777;
-        std::string base = "http://127.0.0.1:" + std::to_string(port) + "/";
-        int total=0, failed=0, plIdx=0, plCount=(int)c.selectedPlaylists.size();
-        for(auto pid : c.selectedPlaylists){
-            plIdx++;
-            std::wstring* prog=new std::wstring(L"正在获取歌单 " + std::to_wstring(plIdx) + L"/" + std::to_wstring(plCount) + L" ...");
-            PostMessageW(hNotif, WM_USER+2, 0, (LPARAM)prog);
-            std::vector<NcmSong> songs; NcmPlaylist info;
-            if(!client.GetPlaylistDetail(pid, songs, &info) || songs.empty()){ failed++; continue; }
-            // 写入歌曲元数据缓存(供本地代理注入流标签: 标题/歌手/专辑/时长/封面)
-            NcmMeta::WritePlaylist(pid, songs);
-            for(auto& s : songs){
-                f << "#EXTINF:" << (s.durationMs/1000) << "," << WideToUtf8(s.artist) << " - " << WideToUtf8(s.title) << "\n";
-                f << base << pid << "/" << s.id << ".mp3\n";
-                total++;
+        SetEvent(ctx->done);
+    });
+
+    RunProgressDialog(this, core_, ctx);
+    if(ctx->cancel.load()){
+        ShowStatus(L"已取消同步");
+    } else if(ctx->resultCode == 0){
+        ImportPlaylist(ctx->m3uPath, ctx->total);
+    } else {
+        ShowStatus(ctx->resultMsg.empty() ? L"同步失败" : ctx->resultMsg);
+    }
+    CloseHandle(ctx->progress); CloseHandle(ctx->done);
+    delete ctx;
+}
+
+// ---------- B1: 主线程辅助(仅主线程调用) ----------
+
+void NcmOptionsFrame::ShowStatus(const std::wstring& s){
+    if(st_) st_->SetValueAsObject(AIMPUI_LABEL_PROPID_TEXT, MakeStr(s.c_str()));
+}
+
+void NcmOptionsFrame::ApplyPlaylists(const std::vector<NcmPlaylist>& pls){
+    if(!lst_) return;
+    loading_ = true;  // 程序化填充期间屏蔽 OnTreeChanged
+    lst_->Clear();
+    IAIMPUITreeListNode* root = nullptr;
+    if(SUCCEEDED(lst_->GetRootNode(IID_IAIMPUITreeListNode, (void**)&root)) && root){
+        NcmConfig cfgSel; ConfigManager::Load(cfgSel);
+        for(auto& pl : pls){
+            std::wstring txt = pl.name + L"  ·  " + std::to_wstring(pl.trackCount) + L"首";
+            if(!pl.creator.empty()) txt += L"  ·  " + pl.creator;
+            IAIMPString* s = MakeStr(txt.c_str());
+            if(s){
+                IAIMPUITreeListNode* node = nullptr;
+                if(SUCCEEDED(root->Add(&node)) && node){
+                    node->SetValue(0, s);
+                    node->SetValueAsInt64(AIMPUI_TL_NODE_PROPID_TAG, pl.id);
+                    bool sel = std::find(cfgSel.selectedPlaylists.begin(),
+                                         cfgSel.selectedPlaylists.end(), pl.id) != cfgSel.selectedPlaylists.end();
+                    node->SetValueAsInt32(AIMPUI_TL_NODE_PROPID_CHECKED,
+                                          sel ? AIMPUI_CHECKSTATE_CHECKED : AIMPUI_CHECKSTATE_UNCHECKED);
+                    node->Release();
+                }
+                s->Release();
             }
         }
-        f.close();
-        // 封面不批量预取: 播放到某首歌时才由本地代理即时下载并缓存
-        if(total==0){
-            wchar_t b[128];
-            swprintf_s(b, L"未获取到歌曲(失败 %d 个歌单) · 请检查登录状态/网络后重试", failed);
-            PostMessageW(hNotif, WM_USER+2, 0, (LPARAM)new std::wstring(b));
-            return;
+        root->Release();
+    }
+    wchar_t buf[64];
+    swprintf_s(buf, L"共 %d 个歌单", (int)pls.size());
+    if(lblCnt_) lblCnt_->SetValueAsObject(AIMPUI_LABEL_PROPID_TEXT, MakeStr(buf));
+    ShowStatus(L"歌单加载完成，勾选后点“应用”保存");
+    SaveConfig(false);
+    loading_ = false;
+    SaveConfig(false);   // loading_=true 时上一步被跳过, 补一次落盘恢复的勾选状态
+}
+
+void NcmOptionsFrame::ImportPlaylist(const std::wstring& m3u, int total){
+    if(!core_) return;
+    ShowStatus(L"正在导入播放列表...");
+    IAIMPServicePlaylistManager* pm = nullptr;
+    if( SUCCEEDED(core_->QueryInterface(IID_IAIMPServicePlaylistManager, (void**)&pm))
+     || SUCCEEDED(core_->CreateObject(IID_IAIMPServicePlaylistManager, (void**)&pm)) ){
+        if(pm){
+            IAIMPString* name = MakeStr(L"网易云串流");
+            IAIMPPlaylist* pl = nullptr;
+            if(name){
+                if(FAILED(pm->GetLoadedPlaylistByName(name, &pl)) || !pl)
+                    pm->CreatePlaylist(name, TRUE, &pl);
+            }
+            if(pl){
+                IAIMPString* path = MakeStr(m3u.c_str());
+                HRESULT hrAdd = E_FAIL;
+                if(path){
+                    pl->BeginUpdate();
+                    pl->DeleteAll();
+                    hrAdd = pl->Add(path, 0, -1);
+                    pl->EndUpdate();
+                    path->Release();
+                }
+                wchar_t b[128];
+                if(SUCCEEDED(hrAdd)) swprintf_s(b, L"已同步 %d 首到播放列表「网易云串流」(本地代理, 播放时实时取链)", total);
+                else swprintf_s(b, L"同步失败 (Add 0x%08X)", (unsigned)hrAdd);
+                ShowStatus(b);
+            } else {
+                ShowStatus(L"无法创建/找到播放列表");
+            }
+            if(name) name->Release();
+            if(pl) pl->Release();
         }
-        PostMessageW(hNotif, WM_USER+5, total, (LPARAM)new std::wstring(m3u));
-        } catch(...){
-            PostMessageW(hNotif, WM_USER+2, 0, (LPARAM)new std::wstring(L"同步线程发生异常"));
-        }
-    }).detach();
+    } else {
+        ShowStatus(L"获取 PlaylistManager 服务失败");
+    }
+    if(pm) pm->Release();
 }
 
 // ---------- 配置加载/保存 ----------
@@ -552,11 +806,15 @@ void NcmOptionsFrame::LoadConfig(){
         }
         if(eCacheWL_ && !cfg.cacheWhitelist.empty())
             eCacheWL_->SetValueAsObject(AIMPUI_BASEEDIT_PROPID_TEXT, MakeStr(cfg.cacheWhitelist.c_str()));
+        if(cboLyric_){
+            IAIMPUIBaseComboBox* cb=(IAIMPUIBaseComboBox*)cboLyric_;
+            cb->SetValueAsInt32(AIMPUI_COMBOBOX_PROPID_ITEMINDEX, cfg.lyricMode == L"none" ? 0 : 1);
+        }
     }
     if(st_){
         std::wstring s = L"就绪";
         if(!cfg.cookie.empty()) s = L"已登录 · Cookie 已保存";
-        else s = L"未登录 · 请点二维码登录";
+        else s = L"未登录 · 请粘贴 Cookie";
         if(cfg.useProxy && !cfg.apiUrl.empty()) s += L"  · 代理: " + cfg.apiUrl;
         else if(!cfg.useProxy) s += L"  · 直连 music.163.com";
         st_->SetValueAsObject(AIMPUI_LABEL_PROPID_TEXT, MakeStr(s.c_str()));
@@ -592,6 +850,7 @@ void NcmOptionsFrame::CollectSelection(NcmConfig& cfg){
 void NcmOptionsFrame::SaveConfig(bool notify){
     if(!form_ || loading_) return;
     NcmConfig cfg; ConfigManager::Load(cfg);
+    std::wstring oldCookie = cfg.cookie;
     if(chkProxy_){ int v=0; chkProxy_->GetValueAsInt32(AIMPUI_CHECKBOX_PROPID_STATE, &v); cfg.useProxy=(v==AIMPUI_CHECKSTATE_CHECKED); }
     if(eApi_){
         IAIMPString* s=nullptr;
@@ -620,9 +879,17 @@ void NcmOptionsFrame::SaveConfig(bool notify){
         eCacheWL_->GetValueAsObject(AIMPUI_BASEEDIT_PROPID_TEXT, IID_IAIMPString, (void**)&s);
         if(s){ cfg.cacheWhitelist = AimpStringToWString(s); s->Release(); }
     }
+    if(cboLyric_){
+        int idx = 1;
+        cboLyric_->GetValueAsInt32(AIMPUI_COMBOBOX_PROPID_ITEMINDEX, &idx);
+        cfg.lyricMode = (idx == 0) ? L"none" : L"uslt";
+    }
     // 收集歌单树当前勾选状态(此前勾选从未被保存, "应用"也不会点亮)
     CollectSelection(cfg);
     ConfigManager::Save(cfg);
+    // 换 Cookie 视为重新登录: 刷新设备指纹(仅登录时刷新, 平时复用)
+    if(!cfg.cookie.empty() && cfg.cookie != oldCookie)
+        NcmClient::RegenerateDeviceCookie();
     if(notify && optSvc_) optSvc_->FrameModified(this);
 }
 
@@ -630,70 +897,106 @@ void NcmOptionsFrame::SaveConfig(bool notify){
 
 void NcmOptionsFrame::RefreshPlaylists(){
     if(!form_) return;
-    // 先把输入框当前内容落盘, 避免粘贴后未失焦导致读到旧配置(空cookie)
     SaveConfig(false);
-    if(st_) st_->SetValueAsObject(AIMPUI_LABEL_PROPID_TEXT, MakeStr(L"正在拉取歌单..."));
-    HWND hNotif = NotifWnd();  // 主线程先取好通知窗口, 线程内不再触碰 AIMP COM
-    std::thread([this, hNotif]{
+    ShowStatus(L"正在拉取歌单...");
+
+    ProgCtx* ctx = new ProgCtx();
+    ctx->done     = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ctx->progress = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+    TaskCenter::Run([ctx]{
+        try{
         NcmConfig cfg; ConfigManager::Load(cfg);
         NcmClient client(cfg);
         long long uid=0;
         if(!cfg.uid.empty()) uid=_wtoi64(cfg.uid.c_str());
-        // uid 缺失时双模式自动补全 (镜像/直连), 否则直连模式下永远拉不到歌单
         if(uid==0 && client.GetAccountId(uid)){
             cfg.uid = std::to_wstring(uid);
             ConfigManager::Save(cfg);
         }
         if(uid==0){
-            std::wstring m = cfg.cookie.empty()
-                ? L"未登录 · 请先二维码登录 / 从浏览器导入 / 粘贴 Cookie"
+            ctx->resultCode = 1;
+            ctx->resultMsg = cfg.cookie.empty()
+                ? L"未登录 · 请先粘贴 Cookie"
                 : L"已填入 Cookie 但获取 UID 失败 · 请检查网络/镜像可用性，确认 MUSIC_U 有效后重试";
-            PostMessageW(hNotif, WM_USER+2, 0, (LPARAM)new std::wstring(m));
-            return;
+            SetEvent(ctx->done); return;
         }
         if(cfg.uid.empty()){ cfg.uid = std::to_wstring(uid); ConfigManager::Save(cfg); }
-        std::vector<NcmPlaylist> pls;
-        if(client.GetUserPlaylists(uid, pls, 200)){
-            struct Data{ NcmOptionsFrame* f; std::vector<NcmPlaylist> p; };
-            Data* d=new Data{this, pls};
-            PostMessageW(hNotif, WM_USER+3, 0, (LPARAM)d);
+        if(client.GetUserPlaylists(uid, ctx->playlists, 200)){
+            ctx->resultCode = 0;
         } else {
-            PostMessageW(hNotif, WM_USER+2, 0, (LPARAM)new std::wstring(L"获取歌单失败 · 请检查网络/代理/登录状态"));
+            ctx->resultCode = 1;
+            ctx->resultMsg = L"获取歌单失败 · 请检查网络/代理/登录状态";
         }
-    }).detach();
+        }catch(...){
+            ctx->resultCode = 1; ctx->resultMsg = L"拉取歌单线程异常";
+            FsLog("RefreshPlaylists worker exception");
+        }
+        SetEvent(ctx->done);
+    });
+
+    RunProgressDialog(this, core_, ctx);
+    if(ctx->cancel.load()){
+        ShowStatus(L"已取消拉取歌单");
+    } else if(ctx->resultCode == 0){
+        ApplyPlaylists(ctx->playlists);
+    } else {
+        ShowStatus(ctx->resultMsg);
+    }
+    CloseHandle(ctx->progress); CloseHandle(ctx->done);
+    delete ctx;
 }
 
 void NcmOptionsFrame::TestConnection(){
     if(!form_) return;
-    SaveConfig(false);  // 同步输入框当前内容, 避免测试到旧地址
+    SaveConfig(false);
     NcmConfig cfg; ConfigManager::Load(cfg);
     bool useProxy = cfg.useProxy;
-    // 兼容无协议头写法（如 iwenwiki.com:3000）
     std::wstring api = NormalizeApiUrl(cfg.apiUrl);
     if(useProxy && api.empty()) api = L"http://localhost:3000";
-    if(st_) st_->SetValueAsObject(AIMPUI_LABEL_PROPID_TEXT, MakeStr(L"正在测试连接..."));
-    HWND hNotif = NotifWnd();
-    std::thread([hNotif, api, useProxy]{
-        std::wstring msg;
+    ShowStatus(L"正在测试连接...");
+
+    ProgCtx* ctx = new ProgCtx();
+    ctx->done     = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ctx->progress = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+    TaskCenter::Run([ctx, api, useProxy]{
+        try{
         if(!useProxy){
-            msg = L"直连模式：无需测试（将直连 music.163.com，使用 weapi/eapi）";
-            PostMessageW(hNotif, WM_USER+2, 0, (LPARAM)new std::wstring(msg));
-            return;
-        }
-        std::wstring url = api;
-        if(!url.empty() && url.back()==L'/') url.pop_back();
-        url += L"/login/qr/key?timestamp=" + std::to_wstring(GetTickCount());
-        auto r = HttpClient::Get(url);
-        if(r.status==200 && r.body.find("unikey")!=std::string::npos){
-            msg = L"连接成功 · 镜像可用 (" + api + L")";
-        } else if(r.status!=0){
-            char b[64]; sprintf_s(b,"HTTP %d", r.status);
-            msg = L"连接失败 · " + Utf8ToWide(b) + L"  请检查镜像是否启动 (npm start)";
+            ctx->resultCode = 0;
+            ctx->resultMsg = L"直连模式：无需测试（将直连 music.163.com，使用 weapi/eapi）";
         } else {
-            msg = L"连接失败 · 无法访问 " + api + L"  请检查地址/防火墙";
+            std::wstring url = api;
+            if(!url.empty() && url.back()==L'/') url.pop_back();
+            url += L"/login/qr/key?timestamp=" + std::to_wstring(GetTickCount());
+            auto r = HttpClient::Get(url);
+            if(r.status==200 && r.body.find("unikey")!=std::string::npos){
+                ctx->resultCode = 0;
+                ctx->resultMsg = L"连接成功 · 镜像可用 (" + api + L")";
+            } else if(r.status!=0){
+                char b[64]; sprintf_s(b,"HTTP %d", r.status);
+                ctx->resultCode = 1;
+                ctx->resultMsg = L"连接失败 · " + Utf8ToWide(b) + L"  请检查镜像是否启动 (npm start)";
+            } else {
+                ctx->resultCode = 1;
+                ctx->resultMsg = L"连接失败 · 无法访问 " + api + L"  请检查地址/防火墙";
+            }
         }
-        PostMessageW(hNotif, WM_USER+2, 0, (LPARAM)new std::wstring(msg));
-    }).detach();
+        }catch(...){
+            ctx->resultCode = 1; ctx->resultMsg = L"测试连接线程异常";
+            FsLog("TestConnection worker exception");
+        }
+        SetEvent(ctx->done);
+    });
+
+    RunProgressDialog(this, core_, ctx);
+    if(ctx->cancel.load()){
+        ShowStatus(L"已取消测试");
+    } else {
+        ShowStatus(ctx->resultMsg);
+    }
+    CloseHandle(ctx->progress); CloseHandle(ctx->done);
+    delete ctx;
 }
 
 HWND NcmOptionsFrame::GetHandle(){
@@ -752,6 +1055,8 @@ LRESULT CALLBACK NcmOptionsFrame::FrameWndProc(HWND hWnd, UINT msg, WPARAM wPara
             if(self->st_) self->st_->SetValueAsObject(AIMPUI_LABEL_PROPID_TEXT, self->MakeStr(L"歌单加载完成，勾选后点“应用”保存"));
             self->SaveConfig(false);
             self->loading_ = false;
+            // 上一步 SaveConfig 在 loading_=true 时被跳过, 这里补一次落盘恢复的勾选状态
+            self->SaveConfig(false);
         }
         if(d) delete d;
         return 0;

@@ -5,19 +5,132 @@
 #include "../third_party/nlohmann/json.hpp"
 #include <ctime>
 #include <cstdlib>
+#include <sstream>
 #include <wincrypt.h>
 #pragma comment(lib, "crypt32.lib")
 using json = nlohmann::json;
 
+namespace {
+
+// 解析 LRC 时间戳(支持 mm:ss.xx / mm:ss.xxx), 返回毫秒; 失败返回 false
+bool ParseLrcMs(const std::string& ts, int& outMs){
+    int mm=0, ss=0, frac=0;
+    int n = sscanf_s(ts.c_str(), "%d:%d.%d", &mm, &ss, &frac);
+    if(n < 2) return false;
+    if(n == 2) frac = 0;
+    // 小数位数归一化: 1位->*100, 2位->*10, 3位->*1
+    size_t dot = ts.find('.');
+    if(dot != std::string::npos){
+        int digits = (int)(ts.size() - dot - 1);
+        if(digits == 1) frac *= 100;
+        else if(digits == 2) frac *= 10;
+    }
+    outMs = mm*60000 + ss*1000 + frac;
+    return true;
+}
+
+struct LrcStamp { int ms = 0; std::string raw; };
+
+// 提取一行内全部时间戳与正文起点
+bool ExtractLrcStamps(const std::string& line, std::vector<LrcStamp>& stamps, size_t& textPos){
+    size_t pos = 0;
+    while(pos < line.size() && line[pos] == '['){
+        size_t close = line.find(']', pos);
+        if(close == std::string::npos) break;
+        std::string inner = line.substr(pos+1, close-pos-1);
+        int ms = 0;
+        if(!ParseLrcMs(inner, ms)) break;
+        stamps.push_back({ms, line.substr(pos, close-pos+1)});
+        pos = close + 1;
+    }
+    textPos = pos;
+    return !stamps.empty();
+}
+
+std::string TrimLrcText(const std::string& text){
+    size_t b = text.find_first_not_of(" \t");
+    if(b == std::string::npos) return "";
+    size_t e = text.find_last_not_of(" \t");
+    return text.substr(b, e-b+1);
+}
+
+// 合并原词与翻译: 翻译行按时间戳就近匹配(±350ms 容差, 参考 AIMPLyricsSaver),
+// 输出 "原词行\n[ts]翻译行"; 无翻译时原样返回原词; 逐字歌词(klyric/yrc)不参与
+std::string MergeLyricWithTranslation(const std::string& orig, const std::string& trans){
+    if(orig.empty()) return trans;
+    if(trans.empty()) return orig;
+
+    struct TransLine { int ms = 0; std::string text; };
+    std::vector<TransLine> translated;
+    {
+        std::istringstream in(trans);
+        std::string line;
+        while(std::getline(in, line)){
+            if(!line.empty() && line.back() == '\r') line.pop_back();
+            std::vector<LrcStamp> stamps;
+            size_t textPos = 0;
+            if(!ExtractLrcStamps(line, stamps, textPos)) continue;
+            std::string text = TrimLrcText(line.substr(textPos));
+            if(text.empty()) continue;
+            for(auto& s : stamps) translated.push_back({s.ms, text});
+        }
+    }
+    if(translated.empty()) return orig;
+    std::sort(translated.begin(), translated.end(),
+              [](const TransLine& a, const TransLine& b){ return a.ms < b.ms; });
+
+    std::string out;
+    std::istringstream in(orig);
+    std::string line;
+    while(std::getline(in, line)){
+        if(!line.empty() && line.back() == '\r') line.pop_back();
+        std::vector<LrcStamp> stamps;
+        size_t textPos = 0;
+        bool hasStamp = ExtractLrcStamps(line, stamps, textPos);
+        bool emptyText = hasStamp && TrimLrcText(line.substr(textPos)).empty();
+        out += line; out += "\n";
+        if(!hasStamp || emptyText) continue;      // 元数据行/空行不挂翻译
+        const TransLine* best = nullptr;
+        int bestDiff = 351;
+        for(auto& c : translated){
+            int d = std::abs(c.ms - stamps[0].ms);
+            if(d < bestDiff){ bestDiff = d; best = &c; }
+        }
+        if(best && bestDiff <= 350){
+            out += stamps[0].raw + best->text + "\n";
+        }
+    }
+    return out;
+}
+
+// 从歌单/详情接口的歌曲 JSON 解析 NcmSong
+bool ParseSongJson(const json& s, NcmSong& out){
+    out = NcmSong();
+    out.id = s.value("id", 0LL);
+    out.title = Utf8ToWide(s.value("name",""));
+    out.durationMs = s.value("dt", 0);
+    if(s.contains("ar") && s["ar"].is_array() && !s["ar"].empty()){
+        std::wstring arts;
+        for(size_t i=0;i<s["ar"].size();++i){
+            if(i) arts += L"/";
+            arts += Utf8ToWide(s["ar"][i].value("name",""));
+        }
+        out.artist = arts;
+    }
+    if(s.contains("al") && s["al"].is_object()){
+        out.album = Utf8ToWide(s["al"].value("name",""));
+        if(s["al"].contains("picUrl")) out.coverUrl = Utf8ToWide(s["al"].value("picUrl",""));
+    }
+    return out.id > 0;
+}
+
+} // namespace
+
 // ---- 设备指纹工具（参考 go-musicfox/netease-music） ----
 
-// 生成 52 位随机 hex 的 sDeviceId
+// 生成 52 位随机 hex 的 sDeviceId (用 mt19937+random_device, 避免 rand() 可预测)
 static std::string GenSDeviceId(){
-    std::string out;
-    out.reserve(52);
-    const char* hex="0123456789ABCDEF";
-    for(int i=0;i<52;i++) out += hex[rand()%16];
-    return out;
+    return NcmCrypto::BytesToHex(NcmCrypto::RandomString(26), true);
 }
 // 从 Cookie 串中提取指定键值
 static std::string CookieGet(const std::wstring& cookie, const char* key){
@@ -57,11 +170,6 @@ static std::string GenNtesNuid(){
 
 NcmClient::NcmClient(const NcmConfig& cfg): cfg_(cfg) {}
 
-std::string NcmClient::DoPost(const std::wstring& url, const std::string& body, const std::wstring& extraHeaders){
-    std::wstring cookie = cfg_.cookie;
-    auto r = HttpClient::Post(url, body, extraHeaders, cookie);
-    return r.body;
-}
 std::string NcmClient::RequestMirror(const std::wstring& path, const std::string& jsonData, bool post){
     std::wstring base = cfg_.apiUrl;
     if(!base.empty() && base.back()==L'/') base.pop_back();
@@ -103,6 +211,7 @@ std::string NcmClient::RequestDirect(const std::wstring& uriPath, const std::str
         url = L"https://interface.music.163.com" + euri;
     } else {
         auto w = NcmCrypto::Weapi(jsonData);
+        if(w.encSecKey.empty()) return "";   // C3: RSA 加密失败, 显式失败而不是静默
         std::wstring wparams = Utf8ToWide(w.params);
         std::string encParams = HttpClient::UrlEncodeW(wparams);
         body = "params=" + encParams + "&encSecKey=" + w.encSecKey;
@@ -130,8 +239,20 @@ std::string NcmClient::RequestDirect(const std::wstring& uriPath, const std::str
 }
 
 void NcmClient::EnsureDeviceCookie(){
-    // 初始化/补全设备 Cookie（持久化在成员里，避免每次随机）
+    if(!deviceId_.empty()) return;
+    // 设备指纹持久化在 config.deviceCookie, 只在登录/换 Cookie 时重新生成,
+    // 避免每个 NcmClient 实例(每次请求)都换新指纹导致风控
+    NcmConfig cfg; ConfigManager::Load(cfg);
+    if(!cfg.deviceCookie.empty()){ deviceId_ = cfg.deviceCookie; return; }
+    deviceId_ = BuildDeviceCookie();
+    cfg.deviceCookie = deviceId_;
+    ConfigManager::Save(cfg);
+}
+std::wstring NcmClient::BuildDeviceCookie(){
+    // 初始化/补全设备 Cookie
     // 参考 NeteaseCloudMusicApiEnhanced processCookieObject + go-musicfox
+    srand((unsigned)time(nullptr));   // C2: 时间戳播种 rand(), 避免固定序列
+    std::wstring deviceId_;
     if(deviceId_.empty()){
         deviceId_ = L"os=pc; appver=2.7.1.198277; osver=10; __remember_me=true; "
                     L"deviceId=" + Utf8ToWide(NcmCrypto::RandomString(32)) + L"; "
@@ -151,119 +272,15 @@ void NcmClient::EnsureDeviceCookie(){
     }
     if(CookieGet(deviceId_, "WNMCID").empty()){
         // WNMCID 格式: <6位随机字母>.<时间戳>.01.0
-        std::string rnd;
-        const char* alpha="abcdefghijklmnopqrstuvwxyz";
-        for(int i=0;i<6;i++) rnd += alpha[rand()%26];
+        std::string rnd = NcmCrypto::RandomString(6);
         deviceId_ += L"; WNMCID=" + Utf8ToWide(rnd + "." + std::to_string(time(nullptr)*1000) + ".01.0");
     }
+    return deviceId_;
 }
-bool NcmClient::QrCreate(QrLogin& out){
-    // type=3 是当前有效协议（参考 NeteaseCloudMusicApiEnhanced，最新维护）
-    std::string jsonData = "{\"type\":3}";
-    std::string resp;
-    if(cfg_.useProxy && !cfg_.apiUrl.empty()) resp = RequestMirror(L"/login/qr/key", jsonData);
-    else resp = RequestDirect(L"/api/login/qrcode/unikey", jsonData);
-    try {
-        auto j = json::parse(resp);
-        std::string key;
-        if(j.contains("data") && j["data"].contains("unikey")) key = j["data"]["unikey"].get<std::string>();
-        else if(j.contains("unikey")) key = j["unikey"].get<std::string>();
-        else if(j.contains("data") && j["data"].contains("data") && j["data"]["data"].contains("unikey")) key = j["data"]["data"]["unikey"].get<std::string>();
-        if(key.empty()) return false;
-        out.unikey=key;
-        // 生成 chainId（新协议要求，否则手机端提示"设备环境异常"）
-        // chainId = v1_<sDeviceId>_web_login_<timestamp_ms>  (参考 go-musicfox)
-        EnsureDeviceCookie();
-        std::string sdev = CookieGet(deviceId_, "sDeviceId");
-        if(sdev.empty()){
-            sdev = GenSDeviceId();
-            deviceId_ += L"; sDeviceId=" + Utf8ToWide(sdev);
-        }
-        long long ms = (long long)time(nullptr) * 1000;
-        std::string chainId = "v1_" + sdev + "_web_login_" + std::to_string(ms);
-        // 注意: 官方用 http:// 而非 https://
-        out.qrUrl = L"http://music.163.com/login?codekey=" + Utf8ToWide(key) + L"&chainId=" + Utf8ToWide(chainId);
-        return true;
-    } catch(...){ return false; }
-}
-int NcmClient::QrCheck(const std::string& key, std::string& outCookie, std::wstring& outMsg, std::wstring* outChallengeUrl, long long* outUid){
-    json j; j["key"]=key; j["type"]=3;
-    std::string resp;
-    std::map<std::string,std::string> setCookies;
-    if(cfg_.useProxy && !cfg_.apiUrl.empty()){
-        resp = RequestMirror(L"/login/qr/check", j.dump());
-    } else {
-        // 直连: 需要拿 Set-Cookie 头（登录态在响应头里）
-        auto w = NcmCrypto::Weapi(j.dump());
-        std::wstring wparams = Utf8ToWide(w.params);
-        std::string encParams = HttpClient::UrlEncodeW(wparams);
-        std::string body = "params=" + encParams + "&encSecKey=" + w.encSecKey;
-        std::wstring headers =
-            L"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\n"
-            L"Referer: https://music.163.com\r\n"
-            L"Origin: https://music.163.com";
-        EnsureDeviceCookie();
-        std::wstring cookie = deviceId_;
-        if(!cfg_.cookie.empty()){
-            if(!cookie.empty()) cookie += L"; ";
-            cookie += cfg_.cookie;
-        }
-        auto r = HttpClient::Post(L"https://music.163.com/weapi/login/qrcode/client/login", body, headers, cookie);
-        resp = r.body;
-        setCookies = r.cookies;
-    }
-    try{
-        auto js = json::parse(resp);
-        int code = js.value("code", 0);
-        if(js.contains("data") && js["data"].is_object() && js["data"].contains("code")) code = js["data"].value("code", code);
-        // 提取风控验证跳转地址(滑块challenge): 顶层/data/body 均可能携带
-        auto pickRedirect = [](const json& o)->std::string{
-            for(const char* k : {"redirectUrl","redirect_url","verifyUrl","captchaUrl"}){
-                if(o.contains(k) && o[k].is_string()){
-                    auto v = o[k].get<std::string>();
-                    if(!v.empty()) return v;
-                }
-            }
-            return "";
-        };
-        std::string redirect = pickRedirect(js);
-        if(redirect.empty() && js.contains("data") && js["data"].is_object()) redirect = pickRedirect(js["data"]);
-        if(redirect.empty() && js.contains("body") && js["body"].is_object()) redirect = pickRedirect(js["body"]);
-        if(outChallengeUrl) *outChallengeUrl = Utf8ToWide(redirect);
-        if(code==803){
-            // 优先从 Set-Cookie 头收集完整登录态（MUSIC_U 等）
-            std::string sc;
-            for(auto& kv : setCookies){
-                if(!sc.empty()) sc += "; ";
-                sc += kv.first + "=" + kv.second;
-            }
-            if(!sc.empty()){
-                outCookie = sc;
-            } else if(js.contains("cookie")) outCookie = js["cookie"].get<std::string>();
-            else if(js.contains("data") && js["data"].contains("cookie")) outCookie = js["data"]["cookie"].get<std::string>();
-            outMsg = L"login success";
-            if(outUid){
-                // 803 响应体自带账号信息, 直接提取 uid (MUSIC_U 已无法解析出 uid)
-                auto pickUid = [](const json& o)->long long{
-                    if(o.contains("account") && o["account"].is_object())
-                        return o["account"].value("id", 0LL);
-                    if(o.contains("profile") && o["profile"].is_object())
-                        return o["profile"].value("userId", 0LL);
-                    return 0;
-                };
-                long long u = pickUid(js);
-                if(!u && js.contains("data") && js["data"].is_object()) u = pickUid(js["data"]);
-                if(!u && js.contains("body") && js["body"].is_object()) u = pickUid(js["body"]);
-                *outUid = u;
-            }
-            return 803;
-        } else if(code==802){ outMsg=L"待确认，请在手机上点击确认"; return 802; }
-        else if(code==801){ outMsg=L"等待扫码"; return 801; }
-        else if(code==800){ outMsg=L"二维码已过期，请重新获取"; return 800; }
-        else if(code==8821){ outMsg=L"需要行为验证（请在手机上完成验证后重新扫码）"; return 8821; }
-        else if(code==8822){ outMsg=L"需要验证码，请在手机上查看"; return 8822; }
-        return code;
-    } catch(...){ return -1; }
+void NcmClient::RegenerateDeviceCookie(){
+    NcmConfig cfg; ConfigManager::Load(cfg);
+    cfg.deviceCookie = BuildDeviceCookie();
+    ConfigManager::Save(cfg);
 }
 bool NcmClient::GetAccountId(long long& uid){
     // 双模式获取当前账号 uid: 镜像走 /user/account, 直连走 weapi /api/nuser/account/get
@@ -319,50 +336,91 @@ bool NcmClient::GetUserPlaylists(long long uid, std::vector<NcmPlaylist>& out, i
     } catch(...){ return false; }
 }
 bool NcmClient::GetPlaylistDetail(long long pid, std::vector<NcmSong>& outSongs, NcmPlaylist* info){
-    std::string resp;
+    outSongs.clear();
+    if(info) *info = NcmPlaylist();
+
     if(cfg_.useProxy && !cfg_.apiUrl.empty()){
-        std::wstring url = cfg_.apiUrl + L"/playlist/track/all?id=" + std::to_wstring(pid) + L"&limit=1000";
-        if(!cfg_.cookie.empty()) url += L"&cookie=" + Utf8ToWide(HttpClient::UrlEncodeW(cfg_.cookie));
-        auto r = HttpClient::Get(url);
-        resp = r.body;
-    } else {
-        json j; j["id"]=pid; j["n"]=100000; j["s"]=8;
-        resp = RequestDirect(L"/api/v6/playlist/detail", j.dump());
-    }
-    try{
-        auto js=json::parse(resp);
-        json songs;
-        if(js.contains("songs")) songs=js["songs"];
-        else if(js.contains("body") && js["body"].contains("songs")) songs=js["body"]["songs"];
-        else if(js.contains("playlist") && js["playlist"].contains("tracks")) songs=js["playlist"]["tracks"];
-        else return false;
-        outSongs.clear();
-        for(auto& s: songs){
-            NcmSong song;
-            song.id = s.value("id",0LL);
-            song.title = Utf8ToWide(s.value("name",""));
-            song.durationMs = s.value("dt",0);
-            if(s.contains("ar") && s["ar"].is_array() && !s["ar"].empty()){
-                std::wstring arts;
-                for(size_t i=0;i<s["ar"].size();++i){
-                    if(i) arts+=L"/";
-                    arts+=Utf8ToWide(s["ar"][i].value("name",""));
+        // 镜像: /playlist/track/all 按 1000/页 offset 分页拉取
+        long long offset = 0;
+        for(;;){
+            std::wstring url = cfg_.apiUrl + L"/playlist/track/all?id=" + std::to_wstring(pid) +
+                               L"&limit=1000&offset=" + std::to_wstring(offset);
+            if(!cfg_.cookie.empty()) url += L"&cookie=" + Utf8ToWide(HttpClient::UrlEncodeW(cfg_.cookie));
+            auto r = HttpClient::Get(url);
+            try{
+                auto js = json::parse(r.body);
+                json songs;
+                if(js.contains("songs")) songs = js["songs"];
+                else if(js.contains("body") && js["body"].contains("songs")) songs = js["body"]["songs"];
+                else if(js.contains("playlist") && js["playlist"].contains("tracks")) songs = js["playlist"]["tracks"];
+                else break;
+                if(!songs.is_array() || songs.empty()) break;
+                for(auto& s : songs){ NcmSong song; if(ParseSongJson(s, song)) outSongs.push_back(song); }
+                if(info && info->name.empty() && js.contains("playlist") && js["playlist"].is_object()){
+                    info->id = pid;
+                    if(js["playlist"].contains("name")) info->name = Utf8ToWide(js["playlist"].value("name",""));
                 }
-                song.artist=arts;
-            }
-            if(s.contains("al")){
-                song.album=Utf8ToWide(s["al"].value("name",""));
-                if(s["al"].contains("picUrl")) song.coverUrl=Utf8ToWide(s["al"].value("picUrl",""));
-            }
-            outSongs.push_back(song);
+                if(songs.size() < 1000) break;   // 不足一页即拉完
+                offset += 1000;
+            }catch(...){ break; }
         }
-        if(info && js.contains("playlist")){
-            auto p=js["playlist"];
-            info->id=pid;
-            if(p.contains("name")) info->name=Utf8ToWide(p.value("name",""));
-            info->trackCount=(int)outSongs.size();
+        if(info) info->trackCount = (int)outSongs.size();
+        return !outSongs.empty();
+    }
+
+    // 直连: v6/playlist/detail 返回前 1000 首 + 完整 trackIds,
+    // 超出部分按 1000/批经 v3/song/detail 补拉
+    json j; j["id"]=pid; j["n"]=100000; j["s"]=8;
+    std::string resp = RequestDirect(L"/api/v6/playlist/detail", j.dump());
+    try{
+        auto js = json::parse(resp);
+        json tracks;
+        if(js.contains("songs")) tracks = js["songs"];
+        else if(js.contains("body") && js["body"].contains("songs")) tracks = js["body"]["songs"];
+        else if(js.contains("playlist") && js["playlist"].contains("tracks")) tracks = js["playlist"]["tracks"];
+        else return false;
+        if(!tracks.is_array()) return false;
+
+        std::vector<long long> trackIds;
+        if(js.contains("playlist") && js["playlist"].contains("trackIds") && js["playlist"]["trackIds"].is_array()){
+            for(auto& t : js["playlist"]["trackIds"]) trackIds.push_back(t.value("id", 0LL));
         }
-        return true;
+
+        for(auto& s : tracks){ NcmSong song; if(ParseSongJson(s, song)) outSongs.push_back(song); }
+
+        // 分页补拉: 从已获取数量处继续, 避免与首批重复
+        if(trackIds.size() > outSongs.size()){
+            for(size_t off = outSongs.size(); off < trackIds.size(); off += 1000){
+                size_t end = std::min(trackIds.size(), off + 1000);
+                json c = json::array();
+                for(size_t i = off; i < end; i++) c.push_back({{"id", trackIds[i]}});
+                json dj; dj["c"] = c.dump();
+                std::string dresp = RequestDirect(L"/api/v3/song/detail", dj.dump());
+                try{
+                    auto djs = json::parse(dresp);
+                    json arr;
+                    if(djs.contains("songs")) arr = djs["songs"];
+                    else if(djs.contains("body") && djs["body"].contains("songs")) arr = djs["body"]["songs"];
+                    if(arr.is_array()){
+                        std::map<long long, json> byId;
+                        for(auto& s : arr) byId[s.value("id", 0LL)] = s;
+                        for(size_t i = off; i < end; i++){
+                            auto it = byId.find(trackIds[i]);
+                            if(it != byId.end()){
+                                NcmSong song;
+                                if(ParseSongJson(it->second, song)) outSongs.push_back(song);
+                            }
+                        }
+                    }
+                }catch(...){}
+            }
+        }
+        if(info && js.contains("playlist") && js["playlist"].is_object()){
+            info->id = pid;
+            if(js["playlist"].contains("name")) info->name = Utf8ToWide(js["playlist"].value("name",""));
+            info->trackCount = (int)outSongs.size();
+        }
+        return !outSongs.empty();
     } catch(...){ return false; }
 }
 bool NcmClient::GetSongUrl(long long id, std::string& outUrl, std::string& outType){
@@ -375,7 +433,9 @@ bool NcmClient::GetSongUrlLevel(long long id, const std::string& levelUtf8, std:
     const std::string level = levelUtf8.empty() ? "exhigh" : levelUtf8;
     // eapi 参数参考 go-musicfox: ids 数组 + level + encodeType + header
     std::string ids = "[" + std::to_string(id) + "]";
-    std::string encodeType = (level=="standard"||level=="higher"||level=="exhigh") ? "aac" : "flac";
+    // encodeType 是 eapi 必填参数(缺失会返回 400 参数错误);
+    // 低三档用 mp3(320k, 不再强制 aac), 无损及以上用 flac, 由上游按此返回容器
+    std::string encodeType = (level=="standard"||level=="higher"||level=="exhigh") ? "mp3" : "flac";
     json j;
     j["ids"] = json::parse(ids);
     j["level"] = level;
@@ -383,8 +443,10 @@ bool NcmClient::GetSongUrlLevel(long long id, const std::string& levelUtf8, std:
     if(level=="sky") j["immerseType"]="c51";
     // eapi 需要 header 字段（参考 go-musicfox CreateRequest）
     json header;
+    EnsureDeviceCookie();   // 确保使用持久化的设备指纹
     header["osver"]="10.0.26100";
-    header["deviceId"]=NcmCrypto::RandomString(32);
+    std::string devId = CookieGet(deviceId_, "deviceId");
+    header["deviceId"] = devId.empty() ? NcmCrypto::RandomString(32) : devId;
     header["appver"]="2.7.1.198277";
     header["versioncode"]="140";
     header["mobilename"]="";
@@ -403,10 +465,12 @@ bool NcmClient::GetSongUrlLevel(long long id, const std::string& levelUtf8, std:
     j["header"] = header;
 
     std::string resp;
+    int httpStatus = 0;   // 诊断: 记录最近一次 HTTP 状态
     if(cfg_.useProxy && !cfg_.apiUrl.empty()){
         std::wstring url = cfg_.apiUrl + L"/song/url/v1?id=" + std::to_wstring(id) + L"&level=" + Utf8ToWide(level);
         if(!cfg_.cookie.empty()) url += L"&cookie=" + Utf8ToWide(HttpClient::UrlEncodeW(cfg_.cookie));
         auto r=HttpClient::Get(url);
+        httpStatus = r.status;
         resp=r.body;
     } else {
         resp = RequestDirect(L"/api/song/enhance/player/url/v1", j.dump(), true);
@@ -423,7 +487,19 @@ bool NcmClient::GetSongUrlLevel(long long id, const std::string& levelUtf8, std:
         if(outUrl.empty()) return fail(("url-empty code="+std::to_string(code)).c_str());
         if(code!=200) return fail(("code="+std::to_string(code)).c_str());
         return true;
-    } catch(...){ return fail("json-parse-error"); }
+    } catch(...){
+        // 诊断: 带 HTTP 状态与响应体前缀, 便于区分风控 HTML / 空响应 / 加密格式变化
+        std::string clean;
+        clean.reserve(resp.size());
+        for(char ch : resp){
+            if(ch == '\r' || ch == '\n') clean += ' ';
+            else if((unsigned char)ch < 0x20) continue;
+            else clean += ch;
+        }
+        if(clean.size() > 96) clean.resize(96);
+        return fail(("json-parse-error http=" + std::to_string(httpStatus) +
+                     " size=" + std::to_string(resp.size()) + " head=" + clean).c_str());
+    }
 }
 bool NcmClient::GetSongDetail(long long id, NcmSong& out){
     json j; j["c"]= std::string("[{\"id\":")+std::to_string(id)+"}]";
@@ -460,8 +536,10 @@ bool NcmClient::GetLyric(long long id, std::string& outLrc){
     else resp = RequestDirect(L"/api/song/lyric", j.dump());
     try{
         auto js=json::parse(resp);
-        if(js.contains("lrc") && js["lrc"].contains("lyric")) outLrc=js["lrc"].value("lyric","");
-        else outLrc="";
+        std::string orig  = js.contains("lrc")    ? js["lrc"].value("lyric","")    : "";
+        std::string trans = js.contains("tlyric") ? js["tlyric"].value("lyric","") : "";
+        // 优先合并中文翻译(tlyric); klyric/yrc 逐字歌词暂不使用
+        outLrc = MergeLyricWithTranslation(orig, trans);
         return true;
     } catch(...){ return false; }
 }

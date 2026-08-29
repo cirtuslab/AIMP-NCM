@@ -5,7 +5,7 @@
 #include "../third_party/aimp_sdk/apiOptions.h"
 #include "../third_party/aimp_sdk/apiPlaylists.h"
 
-class AimpNcmPlugin : public IAIMPPlugin, public IAIMPExternalSettingsDialog {
+class AimpNcmPlugin : public IAIMPPlugin {
 public:
     AimpNcmPlugin();
     // IUnknown
@@ -18,8 +18,6 @@ public:
     HRESULT WINAPI Initialize(IAIMPCore* Core) override;
     HRESULT WINAPI Finalize() override;
     void WINAPI SystemNotification(int NotifyID, IUnknown* Data) override {}
-    // IAIMPExternalSettingsDialog
-    void WINAPI Show(HWND ParentWindow) override;
 
 private:
     volatile LONG ref_=1;

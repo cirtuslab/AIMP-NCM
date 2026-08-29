@@ -1,145 +1,158 @@
-# AIMP NCM · 网易云音乐串流插件
+# AIMP-NCM 插件工作原理
 
-> **AIMPack 插件**（AIMP 5.40+，x86 + x64）：在 AIMP 中直接播放你的网易云音乐歌单。
-> 支持扫码 / 网页 Cookie 登录、音质切换、歌单一键同步，播放时显示完整歌曲信息（标题 / 歌手 / 专辑 / 封面）。
+> 本文档基于当前仓库源码逐行核对编写，描述**当前插件实际**的工作方式（当前版本 **v1.5**）。
+> 旧版 README 与代码不一致之处的修正记录见第 11 节；代码层面尚未解决的问题见
+> `问题.local.md`（本地文档，不入库）。
 
-![GitHub Release](https://img.shields.io/github/v/release/cirtuslab/AIMP-NCM)
+## 1. 一句话概括
 
-## 功能特性
+AIMP 播放列表里的条目是 `http://127.0.0.1:{port}/{pid}/{tid}` 这种**本地代理 URL**
+（无文件后缀：后缀仅为路由占位，实际容器以播放时响应为准）。
+播放时，插件内嵌的 HTTP 服务（LocalServer）实时向网易云解析真实 CDN 链接，把音频流代理给 AIMP，
+并在流开头**注入 ID3v2.3 标签**（标题/歌手/专辑/时长/封面 APIC/歌词 USLT），使 AIMP 的播放器界面、
+封面面板直接显示歌曲信息；同时把音频落盘到临时目录做缓存，支持 Range/seek。
 
-- **原生设置页**：集成在 `设置 → 插件 → 网易云串流`，跟随 AIMP 皮肤
-- **登录三通道**：
-  1. 🌐 **官方网页登录（推荐）**——在浏览器正常登录 music.163.com 后粘贴 Cookie，无风控（GUI 另支持从 Edge/Firefox/Chrome 自动读取）
-  2. 📱 **扫码登录**——新协议（`type=3` + `chainId`）；若命中滑块验证会自动用浏览器打开验证页，完成后自动继续
-  3. 📋 **Cookie 直填**——只粘裸值也可以（自动补 `MUSIC_U=` 键名）
-- **歌单同步**：勾选歌单 → 点「应用」→ 自动创建/刷新播放列表「网易云串流」，勾选状态持久化
-- **完整歌曲信息**：播放时本地代理向音频流注入 ID3v2 标签（标题 / 歌手 / 专辑 / 时长 / 封面），AIMP 播放器与封面面板直接显示；封面按播放即时下载并磁盘缓存，**无批量请求**
-- **本地代理播放**：内嵌 `http://127.0.0.1:{port}` 服务（默认 47777，占用自动后移），实时解析真实 CDN 链接并代理拉流，支持磁盘缓存与 Range/seek——链接不过期、无需预取
-- **音质**：`standard / higher / exhigh / lossless / hires / jymaster / jyeffect / sky`，实时生效（高音质需会员，否则自动降级）
-- 直连国内可用；海外/受限网络可启用代理镜像
+## 2. 组件总览
 
-## 安装
+| 目录/文件 | 角色 |
+|---|---|
+| `plugin/` | C++ DLL `aimp_ncm.dll`，真正的 AIMP 插件（x86 + x64） |
+| `ncm_service/` | 可选镜像服务：`server.js`（Node，封装 NeteaseCloudMusicApi）、`app.py`（Python 简化版） |
+| `tools/fix_aimp_plugin_perm.ps1` | 免 UAC：给 AIMP 插件目录授权 Users 写权限 |
+| `build.ps1` / `release.ps1` | x86+x64 构建与 `aimp_ncm.aimppack` 打包 |
 
-从 [Releases](https://github.com/cirtuslab/AIMP-NCM/releases/latest) 下载 `aimp_ncm.aimppack`：
+## 3. 配置
 
-```powershell
-# 方式一：双击 aimp_ncm.aimppack（可能弹 UAC）
-# 方式二：静默安装
-powershell -ExecutionPolicy Bypass -File install.ps1
-# 免 UAC（管理员运行一次即可）
-powershell -ExecutionPolicy Bypass -File tools/fix_aimp_plugin_perm.ps1
-```
+路径：`%APPDATA%\AIMP\NcmPlugin\config.json`（插件使用）。
 
-从源码构建：
+| 字段 | 含义 |
+|---|---|
+| `cookie` | 登录态（`MUSIC_U=...` 等），明文保存 |
+| `apiUrl` | 镜像地址，为空则直连 `music.163.com` |
+| `quality` | `standard/higher/exhigh/lossless/hires/jymaster/jyeffect/sky`，默认 `exhigh` |
+| `useProxy` | `true` 走镜像，`false` 直连 |
+| `uid` | 登录账号 ID，拉歌单时自动补全 |
+| `localPort` | 本地代理端口，默认 47777，被占用时自动 +1 并回写 |
+| `cacheDays` | 播放缓存保留天数；`-1` 永不删除（白名单例外） |
+| `cacheWhitelist` | 白名单歌单 ID（逗号分隔），其缓存永不清理 |
+| `lyricMode` | 歌词注入模式：`none` 不注入 / `uslt` 流内注入 USLT 歌词帧（默认，mp3/flac/wav 均验证可行） |
+| `deviceCookie` | 设备指纹 Cookie（首次生成后持久化，仅登录/换 Cookie 时刷新） |
+| `selectedPlaylists` | 勾选待同步的歌单 ID 数组 |
 
-```powershell
-powershell -ExecutionPolicy Bypass -File build.ps1   # 生成 dist/aimp_ncm.aimppack (x86+x64)
-```
+## 4. 插件生命周期与注册
 
-需要 VS2022/2026（含 C++ 工具链与 CMake）。
+`AIMPPluginGetHeader` → `AimpNcmPlugin`（`IAIMPPlugin` + `IAIMPExternalSettingsDialog`）。
+`Initialize` 依次：
 
-## 使用（四步）
+1. 注册 `ncm://` 文件系统与文件信息提供者
+   （`IID_IAIMPServiceFileSystems` / `IID_IAIMPServiceFileInfo`，参考 AIMPYouTube 的注册方式）；
+2. 启动 LocalServer（仅绑定 127.0.0.1，默认 47777，最多向后试 20 个端口，成功后回写实际端口到配置）；
+3. 注册原生选项页（`IID_IAIMPServiceOptionsDialog`，即 设置 → 插件 → 网易云串流）。
 
-1. **登录**：推荐先在浏览器登录 music.163.com，然后把 Cookie 粘贴进设置页
-   （F12 → 应用/存储 → Cookie → 复制 `MUSIC_U` 整段；值长达数百字符属正常）
-2. **网络**：国内保持直连；海外勾选「启用代理」并填镜像地址（如 `iwenwiki.com:3000`，带不带 `http://` 都行）
-3. **拉取歌单**：点「刷新歌单」（UID 缺失会自动补全）
-4. **同步**：勾选歌单 → 点「应用」→ 左侧出现「网易云串流」播放列表，双击即播
+`Finalize`：先停 LocalServer，再注销/释放两个扩展。注册后的扩展对象由插件持有到 `Finalize`，
+不会提前 `Release`（代码注释明确说明这是为了防止 AIMP 持有悬空指针）。
 
-## 配置文件
+## 5. 歌单同步（设置页点「应用」）
 
-`%APPDATA%\AIMP\NcmPlugin\config.json`（插件与 GUI 共用）
+`NcmOptionsFrame::StartSync`（后台线程）：
 
-```json
-{
-  "cookie": "MUSIC_U=...",
-  "apiUrl": "",
-  "useProxy": false,
-  "quality": "exhigh",
-  "uid": "123456",
-  "localPort": 47777,
-  "selectedPlaylists": [123456789]
-}
-```
+1. 读取 `selectedPlaylists`；
+2. 逐个歌单调 `NcmClient::GetPlaylistDetail`（镜像：`GET /playlist/track/all?id=..&limit=1000`；
+   直连：weapi `/api/v6/playlist/detail`，超过 1000 首按 1000/页分页补拉）；
+3. `NcmMeta::WritePlaylist` 把整张歌单写入 `%TEMP%\aimp_ncm\song_meta.json`
+   （结构 `{pid: {tid: {title, artist, album, durationMs, coverUrl}}}`）；
+4. 生成合并 m3u8：`%TEMP%\aimp_ncm\ncm_playlist.m3u8`，
+   每首一行 `#EXTINF` + `http://127.0.0.1:{port}/{pid}/{tid}`；
+5. 主线程（`WM_USER+5`）经 `IAIMPServicePlaylistManager` 找到或创建播放列表「网易云串流」，
+   `BeginUpdate → DeleteAll → Add(m3u8) → EndUpdate`。
 
-## 架构
+同步阶段**不**批量取真实链接、**不**批量下载封面；只写元数据缓存，链接在播放时才解析
+（因此「链接不过期」）。
 
-```
-AIMP 播放 http://127.0.0.1:{port}/{pid}/{tid}.mp3
-        └─► 插件内嵌 LocalServer: eapi/weapi 实时解析真实 CDN 链接
-             ├─► 缓存命中 → 直接回本地缓存文件（支持 Range）
-             └─► 未命中 → 代理拉流并落盘缓存
-             响应前置 ID3v2 标签(标题/歌手/专辑/时长/封面)
-                  └─► AIMP 解码器解析标签 → 播放器显示歌曲信息与封面
+## 6. 播放链路（核心）
 
-设置页 ──► weapi/eapi 直连 music.163.com 或 镜像 http://{apiUrl}
-登录   ──► 扫码: /weapi/login/qrcode/* (+chainId 防风控)
-        └─► Cookie 直填 / 浏览器导入(GUI)
-```
+AIMP 请求 `http://127.0.0.1:{port}/{pid}/{tid}` → `LocalServer::HandleClient`：
 
-## GUI 调试工具（可选，非必需）
+1. 解析 `pid/tid`，解析 `Range` 头（只支持 `bytes=N-` 形式）；
+2. `NcmMeta::BuildStreamTag` 生成 ID3v2.3 标签（`TIT2/TPE1/TALB/APIC` + 可选 `USLT` 歌词帧，
+   不注入 TLEN，时长由 AIMP 按流实测），
+   封面来自 `%TEMP%\aimp_ncm\artwork\{tid}.img`，歌词来自 `%TEMP%\aimp_ncm\lyric\{tid}.lrc`，
+   没有则即时下载后落盘（歌词受 `lyricMode` 控制，失败不影响播放）；
+3. **缓存命中** → `ServeFile`：虚拟流 = ID3 标签 + 音频文件，Range 偏移减去标签长度映射到文件；
+4. **缓存未命中** → 取链：按配置音质从高到低回退（`GetSongUrlLevel`，直连 eapi
+   `/api/song/enhance/player/url/v1`，镜像 `GET /song/url/v1`），取第一个可用的
+   **最高音质**（配置音质不存在时自动降级）；
+   **拉流失败不降级**：同一链接后台重试最多 3 次，仍失败则弹窗提示
+   「此曲不可用」并向 AIMP 返回 404；
+5. `ProxyAndCache`：WinHTTP 拉 CDN 流，边转发给 AIMP（只发标签之后的音频）边写
+   `%TEMP%\aimp_ncm\cache\{pid}_{tid}.part`，下载完整后改名 `{pid}_{tid}.{ext}`；
+   客户端中途断开不中断下载，以便下次命中缓存。
 
-`gui/app.py` 为 Tkinter 控制中心，定位是**测试/调试**：
+注意：**不是 302 重定向**。`local_server.h` 注释里的「302 重定向返回」已过时；
+当前实现是直接代理 + 流内注入标签（这也是 AIMP 能拿到歌曲信息的原因——网络流不会走
+FileInfoProvider 回调）。
 
-- 三种登录方式测试（扫码 / 从浏览器导入 / 粘贴 Cookie），日志可视化
-- 镜像连通性测试、直连 weapi 自检
-- 歌单拉取、批量预取真实链接生成 m3u8（不依赖插件的备用方案）
-- 与插件共用同一份 config.json 与歌曲元数据缓存，改完即生效
+## 7. 元数据与封面
 
-```bash
-pip install -r gui/requirements.txt
-python gui/app.py
-# 打包单目录 EXE（不易被杀软误报）:
-powershell -ExecutionPolicy Bypass -File gui/build_exe.ps1
-```
+- 元数据缓存 `%TEMP%\aimp_ncm\song_meta.json`：插件在内存维护 `map<pid, map<tid, NcmSong>>`，
+  每次读取前对比文件 mtime，外部写入后插件自动感知；写入用互斥锁保护。
+- 封面缓存 `%TEMP%\aimp_ncm\artwork\{tid}.img`：播放到该曲才下载（URL 自动补 `https:`，
+  **以源头原始尺寸下载**，不再强制 `?param=500y500`），失败跳过、不影响播放。
+- 除流内 ID3 外，`ncm://` 条目另有 `IAIMPExtensionFileInfoProvider::GetFileInfo` 通道，
+  设置 `AIMP_FILEINFO_PROPID_TITLE/ARTIST/ALBUM/DURATION/ALBUMART`；未命中缓存时
+  会同步调 `GetSongDetail` 并 `Upsert` 回缓存。
+- 歌词：`lyricMode=uslt`（默认）时播放链路经 `NcmClient::GetLyric`（`/lyric` 接口）拉取 LRC，
+  以 USLT 帧注入流标签；接口返回多版本（lrc 原词 / tlyric 翻译 / klyric·yrc 逐字），
+  实现上**优先合并翻译**（按时间戳就近匹配、±350ms 容差，参考 AIMPLyricsSaver），
+  逐字歌词暂不使用；实测 AIMP 对 mp3/flac/wav 注入均正常显示歌词。
 
-## 服务端镜像（可选）
+## 8. 登录与网络
 
-海外/受限网络时的中转：
+- **Cookie 直填（唯一登录方式）**：设置页输入，自动补 `MUSIC_U=` 键名、去引号/空白。
+  扫码登录已移除（上游二维码协议失效），浏览器导入随 GUI 一并移除。
+- **直连模式**：weapi/eapi 加密（AES-CBC/ECB + RSA，密钥/IV 硬编码）+ 设备指纹 Cookie
+  （`sDeviceId`/`_ntes_nuid`/`NMTID` 等）；设备指纹**持久化复用**，仅在登录/换 Cookie
+  时刷新；`uid` 缺失时自动经 `/user/account` 补全。
+- **镜像模式**：请求打到 `apiUrl`，cookie 以 `cookie` 表单/查询参数透传。
 
-```bash
-cd ncm_service && npm install && node server.js     # Node: 基于 NeteaseCloudMusicApi
-# 或 Python: pip install requests pycryptodome && python ncm_service/app.py
-```
+## 9. GUI（已移除）
 
-## 常见问题
+原 `gui/app.py`（Tkinter 控制中心）已删除：扫码登录与浏览器导入随之上线风险/维护成本高，
+插件本体只保留 Cookie 直填。
 
-- **播放器不显示歌曲信息/封面？** 重新点一次「应用」同步歌单（元数据在同步时写入本地缓存）；封面在首次播放该曲时即时下载，失败会自动跳过、不影响播放
-- **灰色/404？** 会员音质或版权限制，插件自动降级到 exhigh
-- **境外 460/403？** 启用代理并填国内 VPS 镜像
-- **扫码提示环境异常/滑块？** 会自动打开验证页，完成后继续；或改用官方网页 Cookie 方式（推荐）
-- **应用按钮灰的？** 先「刷新歌单」，勾选后按钮点亮
-- **杀软报 GUI EXE？** PyInstaller 通病，用 onedir 模式产物或加白名单
+## 10. ncm_service 镜像
 
-## 参考的开源项目
+- `server.js`（Node + NeteaseCloudMusicApi，默认端口 3000，**仅绑定 127.0.0.1**）：
+  转发 `user/playlist`、`playlist/track/all`、`song/url/v1`、`song/detail`、`lyric`、
+  `user/account`；按设计接受 `cookie` 参数，因此不监听公网地址。
+- `app.py`（Python 简化版）：实现 `user/playlist`、`playlist/track/all`、`song/url/v1`、
+  `song/detail`、`lyric`、`user/account`，与 Node 版接口集一致（按需选其一即可）。
 
-本项目的协议实现与 AIMP 集成方式大量借鉴了以下开源项目，特此致谢：
+## 11. 历史修正记录（原 README 与代码不一致的解决）
 
-| 项目 | 主要参考点 |
-|------|-----------|
-| [Binaryify/NeteaseCloudMusicApi](https://github.com/Binaryify/NeteaseCloudMusicApi) | Node 镜像服务基础；weapi/eapi 接口行为基准 |
-| [NeteaseCloudMusicApiEnhanced/api-enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced) | 扫码登录新协议（`type=3` + `chainId`）与滑块风控对策 |
-| [go-musicfox/go-musicfox](https://github.com/go-musicfox/go-musicfox) | 设备指纹 Cookie（`sDeviceId`/`_ntes_nuid` 等）与 eapi 歌曲链接参数构造 |
-| [chaunsin/netease-cloud-music](https://github.com/chaunsin/netease-cloud-music) | 网易云协议逆向研究资料（eapi 加密细节） |
-| [AdrianEddy/AIMPYouTube](https://github.com/AdrianEddy/AIMPYouTube) | AIMP 文件系统扩展注册方式与虚拟流播放模式 |
-| [cirtuslab/aimp_desktop_lyrics](https://github.com/cirtuslab/aimp_desktop_lyrics) | AIMP 原生选项页控件布局范式；插件目录权限免 UAC 处理 |
-| [cirtuslab/AIMPLyricsSaver](https://github.com/cirtuslab/AIMPLyricsSaver) | WinHTTP + RapidJSON 的 C++ 插件实现范式 |
-| [cirtuslab/SongMetaFixer](https://github.com/cirtuslab/SongMetaFixer) | 歌曲元数据字段集与网易云详情接口数据源 |
-| [imsyy/SPlayer](https://github.com/imsyy/SPlayer) | 「官方网页登录 → 读取 Cookie」的免风控登录流程 |
-| [martin211/aimp_dotnet](https://github.com/martin211/aimp_dotnet) | AIMP 各扩展类别注册 IID 映射的权威佐证 |
+以下为旧版 README 与代码不一致之处，已随文档更新修正：
 
-## 许可
+1. **302 重定向**：旧 README 架构图说「实时解析真实 CDN 链接并 302 重定向」；
+   实际是**直接代理转发 + 注入 ID3 标签**，代码里根本没有 302。
+2. **登录通道**：旧 README 宣称「三通道登录」；现已改为仅 Cookie 直填，
+   扫码（上游协议失效）与浏览器导入均已移除。
+3. **音质「实时生效」**：旧 README 说音质实时生效；设置页 UI 自己的提示是
+   「切换音质实时生效，**下次播放起生效**」，即只影响后续新请求。
+4. **GUI 定位矛盾**：已随 GUI 移除解决（原 README 与 `gui/README.md` 互相矛盾）。
+5. **`ncm://` 备用路径**：设置页同步写 `http://127.0.0.1` 本地代理条目；
+   `ncm://` 文件系统仍注册，作为备用/兼容路径。
+6. **配置示例不全**：旧 README 的 config.json 示例缺 `cacheDays` / `cacheWhitelist` /
+   `lyricMode`（代码实际读写这些字段）。
+7. **版本号不统一**：插件 `InfoGet` 自述 `[v1.5]`；README 徽章无对应版本说明（仍待统一）。
+8. **遗留入口**：旧设置对话框（`ui_dialog.cpp`，资源 ID 101）曾与原生选项页并存，
+   生成真实 CDN URL 的 m3u8（10 分钟过期）；已下线删除（B4）。
 
-MIT。第三方：AIMP SDK © Artem Izmaylov，nlohmann/json MIT，NeteaseCloudMusicApi MIT。
+## 12. 已知边界
 
----
-
-## ⚠️ 使用风险提示
-
-1. **本项目仅供个人学习与研究**，请勿用于任何商业用途。
-2. 通过非官方接口访问网易云音乐服务**可能违反《网易云音乐用户协议》**，由此导致的账号风控、限流、封禁等后果由使用者自行承担。
-3. 登录凭据（MUSIC_U Cookie 等）以**明文**保存在本地 `%APPDATA%\AIMP\NcmPlugin\config.json` 中，请妥善保管，切勿分享给他人或上传至公开场合；Cookie 泄露等同账号泄露。
-4. 插件会在本机回环地址（127.0.0.1）开启一个 HTTP 端口用于播放代理，仅本机可访问；请勿将其暴露到公网。
-5. 网易云音乐接口随时可能变更导致本项目部分或全部功能失效，作者不承诺持续维护。
-6. 本项目与网易云音乐（网易公司）官方**无任何关联**，不代表官方立场；相关版权归原权利人所有。
-7. **下载、安装或使用本软件即表示您已阅读并理解上述风险，并自愿承担全部责任。** 如不同意，请立即停止使用并卸载。
+- 歌单超过 1000 首时按 1000/页分页拉取（直连经 trackIds + v3/song/detail 补拉，
+  镜像经 `/playlist/track/all` 的 offset 分页）；m3u8 仍逐首写入，大歌单较慢。
+- 取链时自动降到可用最高音质（配置音质不存在时）；拉流失败不降级，
+  同一链接重试 3 次失败即提示「此曲不可用」。
+- 封面 APIC 的 MIME 已按文件头 magic 检测（JPEG/PNG/GIF/BMP/WebP，未知回退 jpeg）。
+- 缓存清理时间基准 bug 已修复（见 `问题.local.md` 更新记录）。
+- 歌词为 USLT 非同步文本；同步滚动歌词（SYLT）尚未实现，待 mock 验证后可选加入。

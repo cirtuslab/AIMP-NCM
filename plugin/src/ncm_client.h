@@ -21,19 +21,10 @@ struct NcmPlaylist {
     std::wstring creator;
 };
 
-struct QrLogin {
-    std::string unikey;
-    std::wstring qrUrl;
-    std::string cookie;
-};
-
 class NcmClient {
 public:
     NcmClient(const NcmConfig& cfg);
     void SetConfig(const NcmConfig& cfg){ cfg_=cfg; }
-    bool QrCreate(QrLogin& out);
-    // outChallengeUrl 非空时表示命中风控滑块/验证码，需在浏览器完成验证
-    int QrCheck(const std::string& key, std::string& outCookie, std::wstring& outMsg, std::wstring* outChallengeUrl=nullptr, long long* outUid=nullptr);
     // 获取当前登录账号 uid (镜像 /user/account 或直连 weapi nuser/account/get)
     bool GetAccountId(long long& uid);
     bool GetUserPlaylists(long long uid, std::vector<NcmPlaylist>& out, int limit=100);
@@ -45,6 +36,9 @@ public:
     bool GetLyric(long long id, std::string& outLrc);
     bool IsLoggedIn();
     static long long ParseUidFromCookie(const std::wstring& cookie);
+    // 设备指纹: 持久化于 config.deviceCookie, 仅登录/换 Cookie 时重新生成
+    static std::wstring BuildDeviceCookie();
+    static void RegenerateDeviceCookie();
     std::wstring GetApiBase() const { return cfg_.apiUrl; }
 private:
     NcmConfig cfg_;
@@ -52,5 +46,4 @@ private:
     void EnsureDeviceCookie();
     std::string RequestMirror(const std::wstring& path, const std::string& jsonData, bool post=true);
     std::string RequestDirect(const std::wstring& uriPath, const std::string& jsonData, bool useEapi=false);
-    std::string DoPost(const std::wstring& url, const std::string& body, const std::wstring& extraHeaders=L"");
 };

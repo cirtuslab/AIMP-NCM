@@ -25,11 +25,12 @@ bool ConfigManager::Load(NcmConfig& cfg) {
         if(j.contains("useProxy")) cfg.useProxy = j.value("useProxy", false);
         else if(j.contains("useDirectApi")) cfg.useProxy = !j.value("useDirectApi", true);
         else cfg.useProxy = !cfg.apiUrl.empty(); // 若有 apiUrl 则默认启用代理
-        cfg.lazyM3U = j.value("lazyM3U", false);
         cfg.uid = Utf8ToWide(j.value("uid",""));
         cfg.localPort = j.value("localPort", 47777);
         cfg.cacheDays = j.value("cacheDays", 7);
         cfg.cacheWhitelist = Utf8ToWide(j.value("cacheWhitelist",""));
+        cfg.lyricMode = Utf8ToWide(j.value("lyricMode","uslt"));
+        cfg.deviceCookie = Utf8ToWide(j.value("deviceCookie",""));
         cfg.selectedPlaylists.clear();
         if (j.contains("selectedPlaylists") && j["selectedPlaylists"].is_array()) {
             for (auto& v : j["selectedPlaylists"]) cfg.selectedPlaylists.push_back(v.get<long long>());
@@ -44,11 +45,12 @@ bool ConfigManager::Save(const NcmConfig& cfg) {
     j["apiUrl"] = WideToUtf8(cfg.apiUrl);
     j["quality"] = WideToUtf8(cfg.quality);
     j["useProxy"] = cfg.useProxy;
-    j["lazyM3U"] = cfg.lazyM3U;
     j["uid"] = WideToUtf8(cfg.uid);
     j["localPort"] = cfg.localPort;
     j["cacheDays"] = cfg.cacheDays;
     j["cacheWhitelist"] = WideToUtf8(cfg.cacheWhitelist);
+    j["lyricMode"] = WideToUtf8(cfg.lyricMode);
+    j["deviceCookie"] = WideToUtf8(cfg.deviceCookie);
     j["selectedPlaylists"] = cfg.selectedPlaylists;
     std::ofstream f(WideToUtf8(p));
     if (!f) return false;

@@ -7,6 +7,9 @@
 #include "../third_party/aimp_sdk/apiCore.h"
 #include "ncm_client.h"
 
+// 诊断日志(定义于 filesystem.cpp): %TEMP%\aimp_ncm\logs\aimp_ncm_fs.log
+void FsLog(const char* what);
+
 // 完整 ncm:// 虚拟文件系统，支持懒加载播放
 // 注意: 播放取流走 IAIMPFileSystemCommandDropSource::CreateStream(2参数版),
 // 参考 AIMPYouTube —— 只实现 CommandStreaming(5参数版)会导致 Unsupported protocol
@@ -50,13 +53,6 @@ public:
     // 统一解析串流条目 URI: ncm://pid/tid(.mp3) 或 http://127.0.0.1:{port}/{pid}/{tid}.{ext}
     static bool ParseStreamUri(const std::wstring& uri, long long& pid, long long& tid);
     static std::wstring MakeUri(long long pid, long long tid);
-
-    // Helper for m3u generation (fallback when FileSystem not registered)
-    static std::wstring MakeFileName(long long pid, long long trackId, const std::wstring& title, const std::wstring& artist) {
-        wchar_t buf[1024];
-        swprintf_s(buf, L"ncm://%lld/%lld.mp3", pid, trackId);
-        return buf;
-    }
 
 private:
     IAIMPCore* core_ = nullptr;

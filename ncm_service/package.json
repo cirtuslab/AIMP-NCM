@@ -1,6 +1,6 @@
 {
   "name": "aimp-ncm-service",
-  "version": "1.0.0",
+  "version": "1.5.0",
   "description": "AIMP NCM 镜像服务 - 封装 NeteaseCloudMusicApi",
   "main": "server.js",
   "scripts": {

@@ -5,19 +5,65 @@
 #include "../third_party/aimp_sdk/apiFileManager.h"
 #include <shlwapi.h>
 #include <fstream>
+#include <mutex>
 #pragma comment(lib, "shlwapi.lib")
 
-// ---- 诊断日志: %TEMP%\aimp_ncm_fs.log ----
+// ---- 诊断日志: %TEMP%\aimp_ncm\logs\aimp_ncm_fs.log ----
+// D5: 单文件 3MB 上限; 超限滚动为 aimp_ncm_fs-<时间戳>.log; 自动删除 7 天前的滚动日志
+namespace {
+std::mutex g_logMtx;
+const ULONGLONG kLogMaxBytes = 3ull * 1024 * 1024;
+const ULONGLONG kLogKeepMs   = 7ull * 24 * 3600 * 1000;
+}
 void FsLog(const char* what){
     WCHAR tmp[MAX_PATH]={0};
     if(!GetTempPathW(MAX_PATH, tmp)) return;
-    std::wstring p = std::wstring(tmp) + L"aimp_ncm_fs.log";
-    std::ofstream f(p.c_str(), std::ios::app);
+    std::wstring dir = std::wstring(tmp) + L"aimp_ncm\\logs\\";
+    CreateDirectoryW((std::wstring(tmp) + L"aimp_ncm").c_str(), nullptr);
+    CreateDirectoryW(dir.c_str(), nullptr);
+    std::wstring path = dir + L"aimp_ncm_fs.log";
+    std::lock_guard<std::mutex> lk(g_logMtx);
+
+    // 3MB 上限 → 滚动为带日期时间的文件
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if(h != INVALID_HANDLE_VALUE){
+        LARGE_INTEGER li;
+        if(GetFileSizeEx(h, &li) && li.QuadPart >= (LONGLONG)kLogMaxBytes){
+            CloseHandle(h);
+            SYSTEMTIME st; GetLocalTime(&st);
+            wchar_t ts[64];
+            swprintf_s(ts, L"-%04d%02d%02d-%02d%02d%02d.log",
+                       st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+            MoveFileExW(path.c_str(), (dir + L"aimp_ncm_fs" + ts).c_str(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+        } else {
+            CloseHandle(h);
+        }
+    }
+
+    std::ofstream f(path.c_str(), std::ios::app);
     if(!f) return;
     SYSTEMTIME st; GetLocalTime(&st);
     char buf[40];
     sprintf_s(buf, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
     f << buf << what << "\n";
+    f.flush();
+
+    // 自动删除 7 天前的滚动日志
+    FILETIME nowFt; GetSystemTimeAsFileTime(&nowFt);
+    ULONGLONG nowMs = (((ULONGLONG)nowFt.dwHighDateTime << 32) | nowFt.dwLowDateTime) / 10000;
+    WIN32_FIND_DATAW fd;
+    HANDLE ff = FindFirstFileW((dir + L"aimp_ncm_fs-*.log").c_str(), &fd);
+    if(ff != INVALID_HANDLE_VALUE){
+        do{
+            ULONGLONG fileMs = (((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime) / 10000;
+            if(nowMs > fileMs && nowMs - fileMs > kLogKeepMs)
+                DeleteFileW((dir + fd.cFileName).c_str());
+        }while(FindNextFileW(ff, &fd));
+        FindClose(ff);
+    }
 }
 void FsLogUri(const char* what, IAIMPString* s){
     std::wstring w = s ? AimpStringToWString(s) : L"(null)";
@@ -102,6 +148,8 @@ HRESULT NcmFileSystem::CreateStream(IAIMPString* FileName, IAIMPStream** Stream)
 HRESULT NcmFileSystem::CreateStream(IAIMPString* FileName, const INT64 Offset, const INT64 Size, LongWord Flags, IAIMPStream** Stream){
     if(!Stream) return E_POINTER;
     *Stream=nullptr;
+    // D6: 5 参版不支持 Range, 返回 E_NOTIMPL 让 AIMP 走 2 参 DropSource(已验证路径)
+    if(Offset != 0 || Size != 0) return E_NOTIMPL;
     FsLogUri("CreateStream[Streaming] called", FileName);
     if(!IsNcmUri(FileName)){ FsLog("  not ncm uri"); return E_FAIL; }
     std::wstring w = AimpStringToWString(FileName);
@@ -138,8 +186,26 @@ HRESULT NcmFileSystem::GetFileAttrs(IAIMPString* FileName, TAIMPFileAttributes* 
     return S_OK;
 }
 HRESULT NcmFileSystem::GetFileSize(IAIMPString* FileName, INT64* Size){
+    if(!Size) return E_POINTER;
+    *Size = 0;
     if(!IsNcmUri(FileName)) return E_FAIL;
-    if(Size) *Size=0;
+    // D6: 缓存命中返回音频文件真实大小(不含注入标签); 未命中返回 0
+    long long pid = 0, tid = 0;
+    std::wstring w = AimpStringToWString(FileName);
+    if(!Parse(w, pid, tid)) return E_FAIL;
+    WCHAR tmp[MAX_PATH] = {0};
+    if(!GetTempPathW(MAX_PATH, tmp)) return S_OK;
+    std::wstring pat = std::wstring(tmp) + L"aimp_ncm\\cache\\" +
+                       std::to_wstring(pid) + L"_" + std::to_wstring(tid) + L".*";
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat.c_str(), &fd);
+    if(h != INVALID_HANDLE_VALUE){
+        FindClose(h);
+        if(!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)){
+            LARGE_INTEGER li; li.HighPart = fd.nFileSizeHigh; li.LowPart = fd.nFileSizeLow;
+            *Size = li.QuadPart;
+        }
+    }
     return S_OK;
 }
 HRESULT NcmFileSystem::IsFileExists(IAIMPString* FileName){

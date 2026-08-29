@@ -1,9 +1,10 @@
 #include "aimp_ncm_plugin.h"
-#include "ui_dialog.h"
 #include "config.h"
 #include "filesystem.h"
 #include "local_server.h"
 #include "ncm_options_frame.h"
+#include "error_notify.h"
+#include "task_center.h"
 
 AimpNcmPlugin::AimpNcmPlugin(){}
 
@@ -11,7 +12,6 @@ HRESULT AimpNcmPlugin::QueryInterface(REFIID riid, void** ppv){
     if(!ppv) return E_POINTER;
     *ppv=nullptr;
     if(IsEqualIID(riid, IID_IUnknown)) *ppv=static_cast<IUnknown*>(static_cast<IAIMPPlugin*>(this));
-    else if(IsEqualIID(riid, IID_IAIMPExternalSettingsDialog)) *ppv=static_cast<IAIMPExternalSettingsDialog*>(this);
     else return E_NOINTERFACE;
     AddRef(); return S_OK;
 }
@@ -22,7 +22,7 @@ PWCHAR AimpNcmPlugin::InfoGet(int Index){
     switch(Index){
     case AIMP_PLUGIN_INFO_NAME: return (PWCHAR)L"AIMP NCM 网易云串流";
     case AIMP_PLUGIN_INFO_AUTHOR: return (PWCHAR)L"cirtuslab / YuzuBD";
-    case AIMP_PLUGIN_INFO_SHORT_DESCRIPTION: return (PWCHAR)L"串流网易云歌单到 AIMP 播放列表 [v1.4]";
+    case AIMP_PLUGIN_INFO_SHORT_DESCRIPTION: return (PWCHAR)L"串流网易云歌单到 AIMP 播放列表 [v1.5]";
     case AIMP_PLUGIN_INFO_FULL_DESCRIPTION: return (PWCHAR)L"支持扫码/网页 Cookie 登录、音质选择、歌单同步、歌曲信息与封面显示，基于 NeteaseCloudMusicApi";
     default: return nullptr;
     }
@@ -32,6 +32,7 @@ DWORD AimpNcmPlugin::InfoGetCategories(){ return AIMP_PLUGIN_CATEGORY_ADDONS; }
 HRESULT AimpNcmPlugin::Initialize(IAIMPCore* Core){
     if(!Core) return E_INVALIDARG;
     core_=Core;
+    NcmErrorNotifyInit(core_);
     // 注册 ncm:// 文件系统 (已修复线程安全)
     // 注意: AIMP 的 RegisterExtension 不持有引用，扩展对象必须由插件自己
     // 持有直到 Finalize()，注册后绝不能 Release()（否则 AIMP 持有悬空指针，
@@ -60,8 +61,6 @@ HRESULT AimpNcmPlugin::Initialize(IAIMPCore* Core){
             FsLog("LocalServer start FAILED");
         }
     } catch(...){}
-    // 注册设置对话框（旧入口保留）
-    core_->RegisterExtension(IID_IAIMPExternalSettingsDialog, static_cast<IAIMPExternalSettingsDialog*>(this));
     // 注册选项页 (新 SDK 原生) - 集成到 设置->插件 左树
     // 同样: 不 Release，由插件持有至 Finalize()
     try {
@@ -73,8 +72,9 @@ HRESULT AimpNcmPlugin::Initialize(IAIMPCore* Core){
 HRESULT AimpNcmPlugin::Finalize(){
     // 先停本地服务(其工作线程会用到配置/网络)
     LocalServer::Stop();
+    // B1: 取消并等待所有后台任务, 避免线程访问已释放的对象
+    TaskCenter::Shutdown();
     if(core_){
-        core_->UnregisterExtension(static_cast<IAIMPExternalSettingsDialog*>(this));
         if(optionsFrame_){
             // 注销选项页扩展，然后释放插件持有的引用
             core_->UnregisterExtension(static_cast<IAIMPOptionsDialogFrame*>(optionsFrame_));
@@ -91,7 +91,4 @@ HRESULT AimpNcmPlugin::Finalize(){
         core_=nullptr;
     }
     return S_OK;
-}
-void AimpNcmPlugin::Show(HWND ParentWindow){
-    ShowNcmSettingsDialog(ParentWindow, core_);
 }

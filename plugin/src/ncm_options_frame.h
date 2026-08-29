@@ -1,5 +1,6 @@
 #pragma once
 #include "config.h"
+#include "ncm_client.h"
 #include "../third_party/aimp_sdk/apiOptions.h"
 #include "../third_party/aimp_sdk/apiCore.h"
 #include "../third_party/aimp_sdk/apiObjects.h"
@@ -9,6 +10,12 @@
 // 集成到 AIMP 设置 -> 插件 的选项页（AIMP 原生 UI 控件）
 class NcmOptionsFrame : public IAIMPOptionsDialogFrame, public IAIMPOptionsDialogFrameKeyboardHelper {
 public:
+    // AIMP 选项页通知 ID(替代魔法数字 0x1/0x3)
+    enum NotifyId {
+        NotifyRefresh = 1,   // 选项页打开/刷新时通知
+        NotifyApply   = 3,   // 用户点「应用」时通知
+    };
+
     NcmOptionsFrame(IAIMPCore* core);
     ~NcmOptionsFrame();
     // IUnknown
@@ -35,6 +42,10 @@ public:
     void TestConnection();
     // 应用设置后: 按勾选生成懒加载 m3u8 并导入 AIMP 播放列表「网易云串流」
     void StartSync();
+    // B1: 主线程辅助(仅主线程调用, 供后台任务结果落地)
+    void ShowStatus(const std::wstring& s);
+    void ApplyPlaylists(const std::vector<NcmPlaylist>& pls);
+    void ImportPlaylist(const std::wstring& m3u, int total);
 
 private:
     // 事件处理器
@@ -43,10 +54,10 @@ private:
     static void OnCookieChanged(NcmOptionsFrame* self);
     static void OnQualityChanged(NcmOptionsFrame* self);
     static void OnTestClicked(NcmOptionsFrame* self);
-    static void OnQrClicked(NcmOptionsFrame* self);
     static void OnRefreshClicked(NcmOptionsFrame* self);
     static void OnTreeChanged(NcmOptionsFrame* self);
     static void OnCacheChanged(NcmOptionsFrame* self){ self->SaveConfig(true); }
+    static void OnLyricChanged(NcmOptionsFrame* self){ self->SaveConfig(true); }
 
     // 遍历歌单树, 把勾选节点的 TAG 收集进 cfg.selectedPlaylists
     void CollectSelection(NcmConfig& cfg);
@@ -86,7 +97,6 @@ private:
     IAIMPUIWinControl* eApi_ = nullptr;
     IAIMPUIButton* btnTest_ = nullptr;
     IAIMPUIWinControl* eCookie_ = nullptr;
-    IAIMPUIButton* btnQr_ = nullptr;
     IAIMPUIWinControl* st_ = nullptr;
     IAIMPUIWinControl* cbo_ = nullptr;
     IAIMPUIButton* btnRefresh_ = nullptr;
@@ -94,6 +104,7 @@ private:
     IAIMPUITreeList* lst_ = nullptr;
     IAIMPUIWinControl* cboCache_ = nullptr;   // 缓存保留时长下拉
     IAIMPUIWinControl* eCacheWL_ = nullptr;   // 白名单歌单ID输入框
+    IAIMPUIWinControl* cboLyric_ = nullptr;   // 歌词注入模式下拉
 
     bool loading_ = false;
 };

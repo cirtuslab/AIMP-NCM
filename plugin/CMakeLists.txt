@@ -13,7 +13,10 @@ endif()
 file(GLOB SRC "src/*.cpp" "src/*.h")
 
 # 生成一个英文路径的 RC 副本（每次 configure 时同步）
-set(NCM_RC_STAGE "$ENV{TEMP}/aimp_ncm_rc_stage")
+# 注意: TEMP 通常形如 C:\Users\...，直接拼进引号字符串会因 \U 等非法转义
+# 导致 CMake 解析失败，必须先用 file(TO_CMAKE_PATH) 转成正斜杠路径。
+file(TO_CMAKE_PATH "$ENV{TEMP}" NCM_RC_STAGE)
+set(NCM_RC_STAGE "${NCM_RC_STAGE}/aimp_ncm_rc_stage")
 file(MAKE_DIRECTORY "${NCM_RC_STAGE}")
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/resources/plugin.rc" "${NCM_RC_STAGE}/plugin.rc" COPYONLY)
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/resources/resource.h" "${NCM_RC_STAGE}/resource.h" COPYONLY)

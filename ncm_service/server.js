@@ -52,4 +52,5 @@ app.all('*', async (req,res)=>{
 })
 
 const PORT = process.env.PORT || 3000
-app.listen(PORT, ()=> console.log(`NCM API server running http://localhost:${PORT}`))
+// 仅监听回环地址: 镜像服务按设计接受 cookie 参数, 不应暴露到局域网/公网
+app.listen(PORT, '127.0.0.1', ()=> console.log(`NCM API server running http://127.0.0.1:${PORT}`))

@@ -1,5 +1,7 @@
 #include "meta_cache.h"
 #include "utils.h"
+#include "error_notify.h"
+#include <cstring>
 #include <fstream>
 #include <winhttp.h>
 #include <mutex>
@@ -16,6 +18,14 @@ std::wstring ArtCacheDir(){
     WCHAR tmp[MAX_PATH] = {0};
     GetTempPathW(MAX_PATH, tmp);
     std::wstring d = std::wstring(tmp) + L"aimp_ncm\\artwork";
+    CreateDirectoryW(d.c_str(), nullptr);
+    return d;
+}
+
+std::wstring LyricCacheDir(){
+    WCHAR tmp[MAX_PATH] = {0};
+    GetTempPathW(MAX_PATH, tmp);
+    std::wstring d = std::wstring(tmp) + L"aimp_ncm\\lyric";
     CreateDirectoryW(d.c_str(), nullptr);
     return d;
 }
@@ -38,12 +48,15 @@ bool ReadFileAll(const std::wstring& path, std::string& out){
 }
 
 void WriteFileAll(const std::wstring& path, const std::string& bytes){
-    HANDLE w = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+    // D4: 先写 .tmp 再原子替换, 避免读者看到半截文件
+    std::wstring tmp = path + L".tmp";
+    HANDLE w = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, nullptr);
     if(w != INVALID_HANDLE_VALUE){
         DWORD written = 0;
         WriteFile(w, bytes.data(), (DWORD)bytes.size(), &written, nullptr);
         CloseHandle(w);
+        MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
     }
 }
 
@@ -76,6 +89,10 @@ bool HttpDownloadBytes(const std::wstring& url, std::string& out){
             if(SUCCEEDED(WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                                             WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) &&
                WinHttpReceiveResponse(req, nullptr)){
+                DWORD status = 0, statusLen = sizeof(status);
+                if(WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                       nullptr, &status, &statusLen, nullptr))
+                    NcmErrorNotifyAccess((int)status);
                 for(;;){
                     DWORD avail = 0;
                     if(!WinHttpQueryDataAvailable(req, &avail) || avail == 0) { ok = true; break; }
@@ -161,8 +178,15 @@ void SaveMetaFile(){
         }
         j[std::to_string(kv.first)] = inner;
     }
-    std::ofstream f(WideToUtf8(MetaCachePath()), std::ios::trunc);
-    if(f) f << j.dump();
+    // D4: 原子写(临时文件 + 替换), 避免多进程/多线程读到半截 JSON
+    std::wstring path = MetaCachePath();
+    std::wstring tmp = path + L".tmp";
+    std::ofstream f(WideToUtf8(tmp), std::ios::trunc);
+    if(f){
+        f << j.dump();
+        f.close();
+        MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    }
     g_meta.mtime = FileMTime(MetaCachePath());
 }
 
@@ -223,17 +247,50 @@ void AppendTextFrame(std::string& out, const char id[4], const std::wstring& tex
     out += content;
 }
 
-// 封面帧 APIC: encoding=0, mime=image/jpeg, pictype=3 (front cover), 空描述
-void AppendApicFrame(std::string& out, const std::string& jpg){
-    if(jpg.empty()) return;
+// 依据文件头 magic 识别图片 MIME (JPEG/PNG/GIF/BMP/WebP), 未知回退 image/jpeg
+std::string DetectImageMime(const std::string& data){
+    if(data.size() >= 3 && (unsigned char)data[0]==0xFF && (unsigned char)data[1]==0xD8 && (unsigned char)data[2]==0xFF)
+        return "image/jpeg";
+    static const char PNG_MAGIC[8] = {(char)0x89,'P','N','G','\r','\n',0x1A,'\n'};
+    if(data.size() >= 8 && memcmp(data.data(), PNG_MAGIC, 8) == 0)
+        return "image/png";
+    if(data.size() >= 6 && data.compare(0, 4, "GIF8") == 0)
+        return "image/gif";
+    if(data.size() >= 2 && data[0]=='B' && data[1]=='M')
+        return "image/bmp";
+    if(data.size() >= 12 && data.compare(0, 4, "RIFF") == 0 && data.compare(8, 4, "WEBP") == 0)
+        return "image/webp";
+    return "image/jpeg";
+}
+
+// 封面帧 APIC: encoding=0, mime=magic 检测, pictype=3 (front cover), 空描述
+void AppendApicFrame(std::string& out, const std::string& img){
+    if(img.empty()) return;
     std::string content;
     content.push_back(0x00);                       // text encoding: latin1
-    content += "image/jpeg";
+    content += DetectImageMime(img);
     content.push_back(0x00);                       // mime terminator
     content.push_back(0x03);                       // picture type: cover (front)
     content.push_back(0x00);                       // description: empty
-    content += jpg;
+    content += img;
     AppendFrameHead(out, "APIC", (unsigned)content.size());
+    out += content;
+}
+
+// 歌词帧 USLT: encoding=1 (UTF-16 with BOM), language=eng, 空描述
+void AppendUsltFrame(std::string& out, const std::string& lrcUtf8){
+    if(lrcUtf8.empty()) return;
+    std::wstring w = Utf8ToWide(lrcUtf8);
+    std::string content;
+    content.push_back(0x01);                       // text encoding: UTF-16
+    content += "eng";                              // ISO-639-2 language
+    content.push_back(0x00);                       // content descriptor: empty
+    content.push_back((char)0xFF); content.push_back((char)0xFE);   // BOM
+    for(wchar_t c : w){
+        content.push_back((char)(c & 0xFF));
+        content.push_back((char)((c >> 8) & 0xFF));
+    }
+    AppendFrameHead(out, "USLT", (unsigned)content.size());
     out += content;
 }
 
@@ -277,28 +334,51 @@ bool GetCoverBytes(long long tid, const std::wstring& coverUrl, std::string& out
     if(ReadFileAll(p, out)) return true;
     if(coverUrl.empty()) return false;
     std::wstring url = NormalizeCoverUrl(coverUrl);
-    if(!HttpDownloadBytes(url + L"?param=500y500", out))
-        if(!HttpDownloadBytes(url, out)) return false;
+    // 封面以源头原始尺寸下载, 不再强制追加 ?param=500y500 缩略参数
+    if(!HttpDownloadBytes(url, out)) return false;
     if(!out.empty()) WriteFileAll(p, out);
     return !out.empty();
 }
 
+bool GetLyricText(long long tid, std::string& out){
+    if(tid <= 0) return false;
+    std::wstring p = LyricCacheDir() + L"\\" + std::to_wstring(tid) + L".lrc";
+    if(ReadFileAll(p, out)) return true;
+    // 未命中: 网络拉取(直连 weapi /api/song/lyric 或镜像 /lyric), 成功后落盘
+    // 注意: 本函数在锁外调用, 可安全进行网络请求
+    NcmConfig cfg; ConfigManager::Load(cfg);
+    NcmClient client(cfg);
+    if(!client.GetLyric(tid, out) || out.empty()) return false;
+    WriteFileAll(p, out);
+    return true;
+}
+
 std::string BuildStreamTag(long long pid, long long tid){
     NcmSong song;
-    std::lock_guard<std::mutex> lk(g_metaMtx);
-    const NcmSong* s = LookupLocked(pid, tid);
-    if(!s) s = LookupByTidLocked(tid);
-    if(!s) return "";
-    song = *s;
+    {
+        // 只在锁内拷贝元数据; 封面/歌词等网络操作一律放到锁外
+        std::lock_guard<std::mutex> lk(g_metaMtx);
+        const NcmSong* s = LookupLocked(pid, tid);
+        if(!s) s = LookupByTidLocked(tid);
+        if(!s) return "";
+        song = *s;
+    }
 
     std::string frames;
     AppendTextFrame(frames, "TIT2", song.title);
     AppendTextFrame(frames, "TPE1", song.artist);
     AppendTextFrame(frames, "TALB", song.album);
-    if(song.durationMs > 0) AppendTextFrame(frames, "TLEN", std::to_wstring(song.durationMs));
+    // 不注入 TLEN: 元数据时长与实际流时长可能不符, 让 AIMP 按流实测
+    // 封面: 磁盘缓存优先, 未命中下载(锁外)
     if(!song.coverUrl.empty()){
         std::string cover;
         if(GetCoverBytes(tid, song.coverUrl, cover)) AppendApicFrame(frames, cover);
+    }
+    // 歌词: 磁盘缓存优先, 未命中拉取(锁外); 失败则不发歌词帧, 不影响播放
+    NcmConfig cfg; ConfigManager::Load(cfg);
+    if(cfg.lyricMode == L"uslt"){
+        std::string lrc;
+        if(GetLyricText(tid, lrc)) AppendUsltFrame(frames, lrc);
     }
     if(frames.empty()) return "";
 

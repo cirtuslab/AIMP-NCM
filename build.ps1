@@ -30,11 +30,16 @@ if(!$cmakeExe){
 }
 Write-Host "CMake: $cmakeExe"
 
+# 显式指定 VS 生成器（默认生成器在部分环境会找不到 MSVC 工具链）
+$genArg = @()
+if($vsPath -match '2022'){ $genArg = @('-G','Visual Studio 17 2022') }
+elseif($vsPath -match '2019'){ $genArg = @('-G','Visual Studio 16 2019') }
+
 # Build x64
 $buildDir = Join-Path $PSScriptRoot "build"
 Remove-Item -LiteralPath $buildDir -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $buildDir | Out-Null
-& $cmakeExe -S $PSScriptRoot -B $buildDir -A x64 2>&1 | Out-Host
+& $cmakeExe -S $PSScriptRoot -B $buildDir @genArg -A x64 2>&1 | Out-Host
 if($LASTEXITCODE -ne 0){ throw "cmake x64 configure failed" }
 & $cmakeExe --build $buildDir --config $Config --parallel 2>&1 | Out-Host
 if($LASTEXITCODE -ne 0){ throw "build x64 failed" }
@@ -43,7 +48,7 @@ if($LASTEXITCODE -ne 0){ throw "build x64 failed" }
 $buildDirX86 = Join-Path $PSScriptRoot "build_x86"
 Remove-Item -LiteralPath $buildDirX86 -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $buildDirX86 | Out-Null
-& $cmakeExe -S $PSScriptRoot -B $buildDirX86 -A Win32 2>&1 | Out-Host
+& $cmakeExe -S $PSScriptRoot -B $buildDirX86 @genArg -A Win32 2>&1 | Out-Host
 if($LASTEXITCODE -ne 0){ throw "cmake x86 configure failed" }
 & $cmakeExe --build $buildDirX86 --config $Config --parallel 2>&1 | Out-Host
 if($LASTEXITCODE -ne 0){ throw "build x86 failed" }
@@ -61,7 +66,9 @@ Copy-Item -Force (Join-Path $buildDirX86 "plugin\$Config\aimp_ncm.dll") "$stage\
 if(!(Test-Path "$stage\aimp_ncm.dll")){
   Copy-Item -Force (Join-Path $buildDirX86 "plugin\aimp_ncm.dll") "$stage\aimp_ncm.dll" -ErrorAction SilentlyContinue
 }
-Copy-Item -Force (Join-Path $PSScriptRoot "README.md") $stage -ErrorAction SilentlyContinue
+Copy-Item -Force (Join-Path $PSScriptRoot "packaging\ReadMe.txt") $stage -ErrorAction SilentlyContinue
+Copy-Item -Force (Join-Path $PSScriptRoot "packaging\manifest.xml") (Join-Path $stage "aimp_ncm.dll.manifest") -ErrorAction SilentlyContinue
+Copy-Item -Force (Join-Path $PSScriptRoot "packaging\manifest.xml") (Join-Path $stage "x64\aimp_ncm.dll.manifest") -ErrorAction SilentlyContinue
 Set-Content -LiteralPath (Join-Path $stage "LICENSE") -Value "MIT" -Encoding UTF8 -ErrorAction SilentlyContinue
 
 $zipTmp = Join-Path $buildDir "AIMP_NCM.zip"
@@ -77,6 +84,6 @@ Copy-Item -Force (Join-Path $stage "aimp_ncm.dll") (Join-Path $dst "x86\aimp_ncm
 
 Write-Host "Build OK:"
 Get-ChildItem $dst | Format-Table Name,Length
-Write-Host "aimppack宸叉寜 AIMP 瑙勮寖鎵撳寘: aimp_ncm/aimp_ncm.dll + aimp_ncm/x64/aimp_ncm.dll"
-Write-Host "鑻ュ弻鍑籥imppack浠嶆彁绀?invalid锛岃鐩存帴杩愯: powershell -ExecutionPolicy Bypass -File dist/install.ps1"
+Write-Host "已生成 AIMP 规范安装包: aimp_ncm/aimp_ncm.dll (x86) + aimp_ncm/x64/aimp_ncm.dll"
+Write-Host "若 aimppack 提示 invalid，请手动将 dist\aimp_ncm.dll 与 dist\x86\aimp_ncm.dll 放入 AIMP\Plugins 对应目录"
 

@@ -6,8 +6,10 @@ dist_gui/
 dist_final/
 release/
 dist/
-!dist/install.ps1
-!dist/README_INSTALL.txt
+# 发布包二进制: 经 GitHub Releases 发布, 不入库
+*.aimppack
+# MSVC 调试符号
+*.pdb
 
 # IDE / 系统
 *.user
@@ -18,5 +20,10 @@ __pycache__/
 node_modules/
 *.log
 .DS_Store
+Thumbs.db
+Desktop.ini
+
+# 本地文档/报告（不随仓库发布）
+*.local.md
 
 # 第三方单头库体积较大但为编译必需, 纳入版本管理(见 plugin/third_party/nlohmann/)

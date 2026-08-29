@@ -19,6 +19,8 @@ bool LookupByTid(long long tid, NcmSong& out);
 void Upsert(long long pid, const NcmSong& song);
 // 取封面字节(磁盘缓存优先, 未命中下载并落盘); 返回是否成功
 bool GetCoverBytes(long long tid, const std::wstring& coverUrl, std::string& out);
+// 取歌词文本(磁盘缓存优先, 未命中经 NcmClient 拉取并落盘); 返回是否成功
+bool GetLyricText(long long tid, std::string& out);
 // 构建 ID3v2.3 标签(含 APIC 封面)作为串流前缀; 无可用信息返回空串(不注入)
 std::string BuildStreamTag(long long pid, long long tid);
 

@@ -170,15 +170,8 @@ std::string NcmCrypto::RsaEncrypt(const std::string& text){
         return outHex;
     }
 fallback:
-    // Fallback random (only for proxy mode, direct will fail but not crash)
-    {
-        std::string rnd; rnd.reserve(256);
-        std::random_device rd; std::mt19937 gen(rd());
-        std::uniform_int_distribution<> dis(0,15);
-        const char* hex="0123456789abcdef";
-        for(int i=0;i<256;i++) rnd+=hex[dis(gen)];
-        return rnd;
-    }
+    // C3: 加密失败不再返回随机值(fail-open), 显式返回空串让调用方失败
+    return "";
 }
 WeapiResult NcmCrypto::Weapi(const std::string& jsonText){
     std::string sec = RandomString(16);
