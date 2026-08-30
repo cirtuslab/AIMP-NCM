@@ -38,6 +38,7 @@ target_link_libraries(aimp_ncm PRIVATE
   winhttp
   bcrypt
   crypt32
+  shell32
   shlwapi
   comctl32
   ws2_32

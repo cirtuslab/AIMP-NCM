@@ -611,13 +611,12 @@ void NcmOptionsFrame::StartSync(){
         try{
             NcmConfig c; ConfigManager::Load(c);
             NcmClient client(c);
-            WCHAR tmp[MAX_PATH]={0}; GetTempPathW(MAX_PATH, tmp);
-            std::wstring dir = std::wstring(tmp) + L"aimp_ncm";
-            CreateDirectoryW(dir.c_str(), nullptr);
+            // m3u8 与 config.json/song_meta.json 同放配置目录, 不混入 %TEMP% 播放缓存
+            std::wstring dir = ConfigManager::GetConfigDir();
             std::wstring m3u = dir + L"\\ncm_playlist.m3u8";
             std::ofstream f(m3u.c_str());
             if(!f){
-                ctx->resultCode = 1; ctx->resultMsg = L"无法创建临时 m3u8 文件";
+                ctx->resultCode = 1; ctx->resultMsg = L"无法创建 m3u8 文件";
                 SetEvent(ctx->done); return;
             }
             f << "#EXTM3U\n";

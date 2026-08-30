@@ -63,7 +63,10 @@ powershell -ExecutionPolicy Bypass -File release.ps1   # 生成 Release 压缩�
 
 ## 配置文件
 
-`%APPDATA%\AIMP\NcmPlugin\config.json`：
+配置目录为 `%APPDATA%\AIMP\NcmPlugin\`，除 `config.json` 外，同步生成的
+`song_meta.json`（歌单元数据）与 `ncm_playlist.m3u8`（播放列表交接文件）也放在这里。
+
+`config.json` 字段：
 
 | 字段 | 含义 |
 |---|---|
@@ -81,33 +84,15 @@ powershell -ExecutionPolicy Bypass -File release.ps1   # 生成 Release 压缩�
 
 ## 本地缓存与日志
 
-播放产生的数据都在系统临时目录 `%TEMP%\aimp_ncm\` 下：
+播放产生的临时数据都在系统临时目录 `%TEMP%\aimp_ncm\` 下（可随时整目录清理，
+元数据与配置在 `%APPDATA%\AIMP\NcmPlugin\` 不受影响）：
 
 | 路径 | 内容 |
 |---|---|
 | `cache\{pid}_{tid}.{ext}` | 音频流缓存（未完成的下载为 `.part` 临时文件，不会被当作缓存命中） |
 | `artwork\{tid}.img` | 封面缓存（首次播放该曲时下载） |
 | `lyric\{tid}.lrc` | 歌词缓存 |
-| `song_meta.json` | 歌单元数据缓存（同步时写入，标题/歌手/专辑/封面地址） |
 | `logs\aimp_ncm_fs.log` | 诊断日志（单文件 3MB 上限，滚动保留 7 天） |
-
-## 架构
-
-```
-AIMP 播放 http://127.0.0.1:{port}/{pid}/{tid}
-        └─► 插件内嵌 LocalServer: eapi/weapi 实时解析真实 CDN 链接
-             ├─► 缓存命中 → 直接回本地缓存文件（支持 Range/seek）
-             └─► 未命中 → 代理拉流并落盘缓存（失败自动重试，不降级音质）
-             响应前置 ID3v2.3 标签(标题/歌手/专辑/封面 APIC/可选歌词 USLT)
-                  └─► AIMP 解码器解析标签 → 播放器显示歌曲信息与封面
-
-设置页 ──► weapi/eapi 直连 music.163.com 或 镜像 http(s)://{apiUrl}
-同步   ──► 拉歌单元数据写入本地缓存 → 生成 m3u8 → 导入 AIMP 播放列表
-```
-
-说明：本地代理是**直接代理转发 + 流内注入标签**，不是 302 重定向——这也是 AIMP 能直接
-从音频流拿到歌曲信息的原因（网络流不经过 FileInfoProvider 回调）。`ncm://` 自定义协议
-文件系统仍注册为备用/兼容路径。
 
 ## 服务端镜像（可选）
 
@@ -123,7 +108,7 @@ pip install -r ncm_service/requirements.txt && python ncm_service/app.py
 
 ## 常见问题
 
-- **播放器不显示歌曲信息/封面？** 重新点一次「应用」同步歌单（元数据在同步时写入本地缓存）；
+- **播放器不显示歌曲信息/封面？** 重新点一次「应用」同步歌单（元数据在同步时写入 song_meta.json）；
   封面在首次播放该曲时即时下载，失败会自动跳过、不影响播放
 - **灰色/404？** 会员音质或版权限制；取链会自动降到可用最高音质，
   拉流失败不降级，重试 3 次仍失败会弹窗提示「此曲不可用」

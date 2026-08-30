@@ -13,12 +13,16 @@ using json = nlohmann::json;
 //        避免用旧快照整份回写、把用户刚保存的其它设置(如 Cookie)回滚。
 static std::mutex g_cfgMtx;
 
-std::wstring ConfigManager::GetConfigPath() {
+std::wstring ConfigManager::GetConfigDir() {
     WCHAR path[MAX_PATH] = {0};
     SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, path);
     std::wstring dir = std::wstring(path) + L"\\AIMP\\NcmPlugin";
     CreateDirectoryW(dir.c_str(), nullptr);
-    return dir + L"\\config.json";
+    return dir;
+}
+
+std::wstring ConfigManager::GetConfigPath() {
+    return GetConfigDir() + L"\\config.json";
 }
 
 namespace {

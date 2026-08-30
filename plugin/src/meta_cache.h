@@ -4,7 +4,8 @@
 #include "ncm_client.h"
 
 // 歌曲元数据与封面公共服务 (插件 FileInfoProvider 与本地代理共用):
-//  - 元数据缓存: %TEMP%\aimp_ncm\song_meta.json (同步时写入, 按文件修改时间自动重载)
+//  - 元数据缓存: %APPDATA%\AIMP\NcmPlugin\song_meta.json (与 config.json 同目录;
+//    同步时写入, 按文件修改时间自动重载)
 //  - 封面缓存:   %TEMP%\aimp_ncm\artwork\{tid}.img
 //  - 流标签:     生成 ID3v2.3 前缀标签(标题/歌手/专辑/时长/封面), 由本地代理注入到串流响应,
 //                使 AIMP 从音频流中解析并显示歌曲信息(网络流不经 FileInfoProvider)

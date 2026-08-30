@@ -132,14 +132,25 @@ inline std::wstring NormalizeCoverUrl(const std::wstring& url){
     return url;
 }
 
-// ---- 元数据缓存: %TEMP%\aimp_ncm\song_meta.json ----
+// ---- 元数据缓存: song_meta.json ----
 // 结构: { "<pid>": { "<tid>": {title, artist, album, durationMs, coverUrl} } }
+// 与 config.json 同放配置目录(%APPDATA%\AIMP\NcmPlugin\): 元数据是持久数据,
+// 不应与 %TEMP% 下可清理的播放缓存混放。首次访问时把旧位置(%TEMP%\aimp_ncm\)的
+// 文件搬过来, 老用户升级后无需重新同步歌单。
 std::wstring MetaCachePath(){
-    WCHAR tmp[MAX_PATH] = {0};
-    GetTempPathW(MAX_PATH, tmp);
-    std::wstring d = std::wstring(tmp) + L"aimp_ncm";
-    CreateDirectoryW(d.c_str(), nullptr);
-    return d + L"\\song_meta.json";
+    static std::once_flag migrateOnce;
+    std::call_once(migrateOnce, []{
+        WCHAR tmp[MAX_PATH] = {0};
+        if(GetTempPathW(MAX_PATH, tmp)){
+            std::wstring oldPath = std::wstring(tmp) + L"aimp_ncm\\song_meta.json";
+            std::wstring newPath = ConfigManager::GetConfigDir() + L"\\song_meta.json";
+            if(GetFileAttributesW(oldPath.c_str()) != INVALID_FILE_ATTRIBUTES &&
+               GetFileAttributesW(newPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+                // COPY_ALLOWED: TEMP 与 APPDATA 可能不在同一卷
+                MoveFileExW(oldPath.c_str(), newPath.c_str(), MOVEFILE_COPY_ALLOWED);
+        }
+    });
+    return ConfigManager::GetConfigDir() + L"\\song_meta.json";
 }
 
 struct MetaDb { std::map<long long, std::map<long long, NcmSong>> byPid; unsigned __int64 mtime = 0; };

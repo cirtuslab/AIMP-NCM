@@ -1,4 +1,4 @@
-param([string]$Version="1.5.1")
+param([string]$Version="1.5.2")
 $ErrorActionPreference="Stop"
 Write-Host "=== AIMP NCM Release $Version ==="
 

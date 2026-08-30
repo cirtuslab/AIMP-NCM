@@ -19,6 +19,9 @@ struct NcmConfig {
 
 class ConfigManager {
 public:
+    // 配置目录(%APPDATA%\AIMP\NcmPlugin, 自动创建)。config.json/song_meta.json/
+    // ncm_playlist.m3u8 等持久文件统一放这里, 与 %TEMP% 下的播放缓存分开。
+    static std::wstring GetConfigDir();
     static std::wstring GetConfigPath();
     static bool Load(NcmConfig& cfg);
     static bool Save(const NcmConfig& cfg);
