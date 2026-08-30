@@ -181,7 +181,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif path=="song/detail":
                 r=ncm_request("/api/v3/song/detail", {"c": q.get("c", "[]")}, q.get("cookie",""))
             elif path=="lyric":
-                r=ncm_request("/api/song/lyric", {"id": int(q.get("id",0)), "lv":1, "tv":1}, q.get("cookie",""))
+                # lv=原词 tv=翻译 kv=老式逐字 klyric yv=新版逐字 yrc(参考 AIMPLyricsSaver)
+                r=ncm_request("/api/song/lyric", {"id": int(q.get("id",0)), "lv":1, "tv":1, "kv":1, "yv":1}, q.get("cookie",""))
             elif path=="user/account":
                 r=ncm_request("/api/nuser/account/get", {}, q.get("cookie",""))
             else:

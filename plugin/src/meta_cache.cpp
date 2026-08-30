@@ -375,12 +375,35 @@ bool GetCoverBytes(long long tid, const std::wstring& coverUrl, std::string& out
 bool GetLyricText(long long tid, std::string& out){
     if(tid <= 0) return false;
     std::wstring p = LyricCacheDir() + L"\\" + std::to_wstring(tid) + L".lrc";
-    if(ReadFileAll(p, out)) return true;
+    // 排查用日志: 命中缓存 / 未命中走网络 / 下载结果
+    if(ReadFileAll(p, out)){
+        char b[160];
+        sprintf_s(b, "lyric tid=%lld CACHE-HIT size=%zu", (long long)tid, out.size());
+        FsLog(b);
+        return true;
+    }
     // 未命中: 网络拉取(直连 weapi /api/song/lyric 或镜像 /lyric), 成功后落盘
     // 注意: 本函数在锁外调用, 可安全进行网络请求
     NcmConfig cfg; ConfigManager::Load(cfg);
     NcmClient client(cfg);
-    if(!client.GetLyric(tid, out) || out.empty()) return false;
+    {
+        char b[160];
+        sprintf_s(b, "lyric tid=%lld CACHE-MISS fetch via %s", (long long)tid,
+                  (cfg.useProxy && !cfg.apiUrl.empty()) ? "mirror" : "direct");
+        FsLog(b);
+    }
+    if(!client.GetLyric(tid, out) || out.empty()){
+        char b[160];
+        sprintf_s(b, "lyric tid=%lld DOWNLOAD-FAIL empty=%d", (long long)tid, (int)out.empty());
+        FsLog(b);
+        return false;
+    }
+    {
+        char b[160];
+        sprintf_s(b, "lyric tid=%lld DOWNLOAD-OK size=%zu yrc/klyric=%s", (long long)tid, out.size(),
+                  out.find('<') != std::string::npos ? "yes" : "no");
+        FsLog(b);
+    }
     WriteFileAll(p, out);
     return true;
 }

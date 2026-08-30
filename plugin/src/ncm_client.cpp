@@ -11,6 +11,8 @@
 #pragma comment(lib, "crypt32.lib")
 using json = nlohmann::json;
 
+void FsLog(const char* what);   // 定义于 filesystem.cpp; 歌词下载诊断日志用
+
 namespace {
 
 // 解析 LRC 时间戳(支持 mm:ss.xx / mm:ss.xxx), 返回毫秒; 失败返回 false
@@ -102,6 +104,92 @@ std::string MergeLyricWithTranslation(const std::string& orig, const std::string
         }
     }
     return out;
+}
+
+// ---- 逐字歌词(YRC/klyric)转换 ----
+// 网易云 YRC 是字级时间戳格式, 每行形如:
+//   [起始ms,持续ms]歌词文本(字起始ms,字持续ms,0)字2(...)
+// 转换为 A2 增强 LRC(行时间戳 + <字时间戳> 逐字标记), AIMP 歌词面板原生支持。
+std::string FormatLrcTimestamp(int timeMs){
+    if(timeMs < 0) timeMs = 0;
+    char buf[32];
+    sprintf_s(buf, "[%02d:%02d.%03d]", timeMs/60000, (timeMs%60000)/1000, timeMs%1000);
+    return buf;
+}
+std::string ConvertYrcToLrc(const std::string& yrc){
+    std::string result;
+    std::istringstream stream(yrc);
+    std::string line;
+    while(std::getline(stream, line)){
+        if(!line.empty() && line.back() == '\r') line.pop_back();
+        size_t first = line.find_first_not_of(" \t");
+        if(first == std::string::npos) continue;
+        // eapi 镜像返回的 yrc 元数据行是 JSON 对象, 跳过避免写进 LRC
+        if(line[first] == '{') continue;
+        if(line[first] != '['){
+            result += line; result += '\n';
+            continue;
+        }
+        size_t close = line.find(']');
+        if(close == std::string::npos){
+            result += line; result += '\n';
+            continue;
+        }
+        // 元数据行: 时间戳后紧跟 JSON 对象(如 {"ver":"1.0"}), 跳过避免写进 LRC
+        {
+            size_t brace = line.find_first_of('{', close);
+            if(brace != std::string::npos && line.find('}', brace) != std::string::npos){
+                std::string tail = line.substr(close + 1);
+                // 仅当时间戳之后除 JSON 外没有其它非空白内容时视为元数据行
+                if(tail.find_first_not_of(" \t{}:\"\\,.-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") == std::string::npos)
+                    continue;
+            }
+        }
+        int startMs = 0, durationMs = 0;
+        if(sscanf_s(line.substr(first+1, close-first-1).c_str(), "%d,%d", &startMs, &durationMs) != 2){
+            result += line; result += '\n';
+            continue;
+        }
+        std::string out = FormatLrcTimestamp(startMs);
+        std::string content = line.substr(close + 1);
+        size_t pos = 0;
+        while(pos < content.size()){
+            if(content[pos] != '('){
+                out += content[pos];
+                ++pos;
+                continue;
+            }
+            size_t wclose = content.find(')', pos);
+            if(wclose == std::string::npos){
+                out += content.substr(pos);
+                break;
+            }
+            int wordStart = 0, wordDuration = 0, flag = 0;
+            if(sscanf_s(content.substr(pos+1, wclose-pos-1).c_str(), "%d,%d,%d",
+                        &wordStart, &wordDuration, &flag) == 3){
+                // <字起始ms> 形式; 输出字词与其后的文本
+                out += '<' + FormatLrcTimestamp(wordStart).substr(1);   // 把 [ 换成 <
+                out.back() = '>';
+                pos = wclose + 1;
+                size_t nextToken = content.find('(', pos);
+                if(nextToken == std::string::npos){
+                    out += content.substr(pos);
+                    pos = content.size();
+                } else {
+                    out += content.substr(pos, nextToken - pos);
+                    pos = nextToken;
+                }
+            } else {
+                out += content[pos];
+                ++pos;
+            }
+        }
+        // 行尾字时间戳: <行起始+行持续>
+        out += '<' + FormatLrcTimestamp(startMs + durationMs).substr(1);
+        out.back() = '>';
+        result += out; result += '\n';
+    }
+    return result;
 }
 
 // 从歌单/详情接口的歌曲 JSON 解析 NcmSong
@@ -537,18 +625,57 @@ bool NcmClient::GetSongDetail(long long id, NcmSong& out){
     } catch(...){ return false; }
 }
 bool NcmClient::GetLyric(long long id, std::string& outLrc){
-    json j; j["id"]=id; j["lv"]=1; j["tv"]=1;
+    // lv=原词 tv=翻译 kv=老式逐字(klyric) yv=新版逐字(yrc);
+    // 逐字歌词需要显式请求才会返回(参考 AIMPLyricsSaver)
+    json j; j["id"]=id; j["lv"]=1; j["tv"]=1; j["kv"]=1; j["yv"]=1;
     std::string resp;
     if(cfg_.useProxy && !cfg_.apiUrl.empty()) resp = RequestMirror(L"/lyric", j.dump());
     else resp = RequestDirect(L"/api/song/lyric", j.dump());
+    {   // 排查用日志: 响应体大小(0 说明接口没返回内容)
+        char b[160];
+        sprintf_s(b, "lyric tid=%lld resp-size=%zu", (long long)id, resp.size());
+        FsLog(b);
+    }
     try{
         auto js=json::parse(resp);
-        std::string orig  = js.contains("lrc")    ? js["lrc"].value("lyric","")    : "";
-        std::string trans = js.contains("tlyric") ? js["tlyric"].value("lyric","") : "";
-        // 优先合并中文翻译(tlyric); klyric/yrc 逐字歌词暂不使用
+        auto lyricOf = [&](const char* key)->std::string{
+            return js.contains(key) ? js[key].value("lyric","") : "";
+        };
+        // 1) 新版逐字 yrc → A2 增强 LRC(行戳 + <字戳>)
+        std::string yrc = lyricOf("yrc");
+        if(!yrc.empty()){
+            std::string enhanced = ConvertYrcToLrc(yrc);
+            if(!enhanced.empty()){
+                // 逐字翻译(ytlrc)按行时间戳就近合并
+                std::string ytrans = lyricOf("ytlrc");
+                if(!ytrans.empty())
+                    enhanced = MergeLyricWithTranslation(enhanced, ytrans);
+                outLrc = enhanced;
+                FsLog("lyric: source=yrc (enhanced)");
+                return true;
+            }
+        }
+        // 2) 老式逐字 klyric(时间戳按字分割, 行戳本身就是逐字粒度, 直接可用)
+        std::string klyric = lyricOf("klyric");
+        if(!klyric.empty()){
+            outLrc = klyric;
+            FsLog("lyric: source=klyric");
+            return true;
+        }
+        // 3) 普通原词 + 翻译
+        std::string orig  = lyricOf("lrc");
+        std::string trans = lyricOf("tlyric");
         outLrc = MergeLyricWithTranslation(orig, trans);
+        {
+            char b[160];
+            sprintf_s(b, "lyric: source=lrc+tlyric orig=%zu trans=%zu", orig.size(), trans.size());
+            FsLog(b);
+        }
         return true;
-    } catch(...){ return false; }
+    } catch(...){
+        FsLog("lyric: JSON parse FAILED (接口响应非 JSON, 可能被风控/网络异常)");
+        return false;
+    }
 }
 bool NcmClient::IsLoggedIn(){ return !cfg_.cookie.empty() && cfg_.cookie.find(L"MUSIC_U")!=std::wstring::npos; }
 long long NcmClient::ParseUidFromCookie(const std::wstring& cookie){
