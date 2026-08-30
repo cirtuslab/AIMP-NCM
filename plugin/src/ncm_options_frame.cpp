@@ -398,7 +398,25 @@ HWND NcmOptionsFrame::CreateFrame(HWND ParentWnd){
             if(btnTest_) PlaceLeft(btnTest_, 56, 22, 8, 1);
         }
 
-        // ---- 行3: Cookie 直填 ----
+        // ---- 行3: 镜像 Token(可选, 与镜像服务 NCM_MIRROR_TOKEN 对应) ----
+        IAIMPUIWinControl* rowToken = MakeRow(grpConn, L"rowToken", 24, 8, 420);
+        if(rowToken){
+            MakeLabel(rowToken, L"lblToken", L"镜像Token:", 62, 20, 0, 2);
+            {
+                CtlEvents* ev = new CtlEvents(this, OnTokenChanged);
+                IAIMPString* nm = MakeStr(L"eToken");
+                hr = uiSvc_->CreateControl(form_, rowToken, nm, (IUnknown*)ev, IID_IAIMPUIEdit, (void**)&eToken_);
+                if(nm) nm->Release();
+                ev->Release();
+                if(SUCCEEDED(hr) && eToken_){
+                    eToken_->SetValueAsObject(AIMPUI_EDIT_PROPID_PASSWORDCHAR, MakeStr(L"●"));
+                    eToken_->SetValueAsObject(AIMPUI_EDIT_PROPID_TEXTHINT, MakeStr(L"镜像服务设置的共享密钥(可选)"));
+                    PlaceLeft(eToken_, 250, 22, 8, 1);
+                }
+            }
+        }
+
+        // ---- 行4: Cookie 直填 ----
         IAIMPUIWinControl* rowCookie = MakeRow(grpConn, L"rowCookie", 24, 8, 420);
         if(rowCookie){
             IAIMPUIWinControl* lblCookie = MakeLabel(rowCookie, L"lblCookie", L"Cookie:", 62, 20, 0, 2);
@@ -569,6 +587,7 @@ void NcmOptionsFrame::DestroyFrame(){
     if(chkProxy_){ chkProxy_->Release(); chkProxy_=nullptr; }
     if(eApi_){ eApi_->Release(); eApi_=nullptr; }
     if(btnTest_){ btnTest_->Release(); btnTest_=nullptr; }
+    if(eToken_){ eToken_->Release(); eToken_=nullptr; }
     if(eCookie_){ eCookie_->Release(); eCookie_=nullptr; }
     if(st_){ st_->Release(); st_=nullptr; }
     if(cbo_){ cbo_->Release(); cbo_=nullptr; }
@@ -626,7 +645,10 @@ void NcmOptionsFrame::StartSync(){
                 if(!m3uBuf.empty()){ f << m3uBuf; f.flush(); m3uBuf.clear(); }
             };
             int port = c.localPort > 0 ? c.localPort : 47777;
+            // 条目携带本地代理 token: http://127.0.0.1:{port}/x/{token}/{pid}/{tid}
+            std::string tok = WideToUtf8(c.localToken);
             std::string base = "http://127.0.0.1:" + std::to_string(port) + "/";
+            if(!tok.empty()) base += "x/" + tok + "/";
             int total=0, failed=0, plIdx=0, plCount=(int)c.selectedPlaylists.size();
             for(auto pid : c.selectedPlaylists){
                 if(ctx->cancel.load() || TaskCenter::IsShuttingDown()){ ctx->resultCode = 2; break; }
@@ -765,6 +787,7 @@ void NcmOptionsFrame::LoadConfig(){
     NcmConfig cfg; ConfigManager::Load(cfg);
     if(chkProxy_) chkProxy_->SetValueAsInt32(AIMPUI_CHECKBOX_PROPID_STATE, cfg.useProxy?AIMPUI_CHECKSTATE_CHECKED:AIMPUI_CHECKSTATE_UNCHECKED);
     if(eApi_ && !cfg.apiUrl.empty()) eApi_->SetValueAsObject(AIMPUI_BASEEDIT_PROPID_TEXT, MakeStr(cfg.apiUrl.c_str()));
+    if(eToken_ && !cfg.mirrorToken.empty()) eToken_->SetValueAsObject(AIMPUI_BASEEDIT_PROPID_TEXT, MakeStr(cfg.mirrorToken.c_str()));
     if(eCookie_ && !cfg.cookie.empty()) eCookie_->SetValueAsObject(AIMPUI_BASEEDIT_PROPID_TEXT, MakeStr(cfg.cookie.c_str()));
     if(cbo_){
         IAIMPUIBaseComboBox* cb=(IAIMPUIBaseComboBox*)cbo_;
@@ -833,6 +856,20 @@ void NcmOptionsFrame::SaveConfig(bool notify){
         IAIMPString* s=nullptr;
         eApi_->GetValueAsObject(AIMPUI_BASEEDIT_PROPID_TEXT, IID_IAIMPString, (void**)&s);
         if(s){ cfg.apiUrl = AimpStringToWString(s); s->Release(); }
+    }
+    if(eToken_){
+        IAIMPString* s=nullptr;
+        eToken_->GetValueAsObject(AIMPUI_BASEEDIT_PROPID_TEXT, IID_IAIMPString, (void**)&s);
+        if(s){
+            std::wstring t = AimpStringToWString(s);
+            // 去除首尾空白/引号, 避免粘贴带入的换行空格导致 Token 头不匹配
+            while(!t.empty() && (t.front()==L' '||t.front()==L'\t'||t.front()==L'\r'||t.front()==L'\n')) t.erase(t.begin());
+            while(!t.empty() && (t.back()==L' '||t.back()==L'\t'||t.back()==L'\r'||t.back()==L'\n')) t.pop_back();
+            if(t.size()>=2 && ((t.front()==L'"'&&t.back()==L'"')||(t.front()==L'\''&&t.back()==L'\'')))
+                t = t.substr(1, t.size()-2);
+            cfg.mirrorToken = t;
+            s->Release();
+        }
     }
     if(eCookie_){
         IAIMPString* s=nullptr;

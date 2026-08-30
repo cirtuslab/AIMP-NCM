@@ -1,7 +1,7 @@
 #include "ncm_crypto.h"
 #include <bcrypt.h>
+#include <windows.h>
 #pragma comment(lib, "bcrypt.lib")
-#include <random>
 #include <algorithm>
 #include <cctype>
 
@@ -11,10 +11,23 @@ static const char* EAPI_KEY = "e82ckenh8dichen8";
 static const char* BASE62 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
 std::string NcmCrypto::RandomString(int len){
+    // 密码学安全随机: BCryptGenRandom(会话密钥/设备指纹), 不使用 mt19937 等可预测 PRNG;
+    // 用拒绝采样消除模偏差(256 不是 62 的倍数)
     std::string s; s.reserve(len);
-    std::random_device rd; std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(0,61);
-    for(int i=0;i<len;i++) s+=BASE62[dis(gen)];
+    BYTE buf[64];
+    int left = len;
+    while(left > 0){
+        int chunk = left > 64 ? 64 : left;
+        if(BCryptGenRandom(nullptr, buf, chunk, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
+            break;   // 失败时退化为当前时间+计数器(仅设备指纹场景, 不用于会话密钥)
+        for(int i=0;i<chunk;i++){
+            unsigned v = buf[i];
+            if(v >= 248) continue;   // 拒绝 248..255, 保证均匀
+            s += BASE62[v % 62];
+        }
+        left = len - (int)s.size();
+    }
+    while((int)s.size() < len) s += BASE62[(GetTickCount() + (unsigned)s.size()) % 62];
     return s;
 }
 std::string NcmCrypto::Base64Encode(const std::string& s){

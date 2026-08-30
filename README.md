@@ -36,14 +36,9 @@
 - 双击 `aimp_ncm.aimppack` 即可完成安装（可能弹 UAC）
 - 或在 AIMP 内安装：主菜单 → 选项... → 插件 → 安装，选择 `.aimppack`，重启 AIMP 生效
 
-免 UAC（管理员运行一次即可，作用于 AIMP 插件目录）：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File tools/fix_aimp_plugin_perm.ps1
-```
-
-> 注意：该脚本会给整个 `AIMP\Plugins` 目录授予 Users 写权限，方便安装但会降低目录安全性，
-> 请自行权衡；如不需要，安装完成后可手动收回权限。
+> 注：旧版曾提供 `tools/fix_aimp_plugin_perm.ps1` 免 UAC 安装脚本（给 `AIMP\Plugins`
+> 目录授 Users 写权限）。该做法会降低系统目录 ACL，允许普通进程向插件目录写入 DLL，
+> 属于安全风险，已移除；请直接使用 UAC 安装或手动复制 DLL。
 
 从源码构建（需要 VS2022/2026，含 C++ 工具链与 CMake）：
 
@@ -70,8 +65,9 @@ powershell -ExecutionPolicy Bypass -File release.ps1   # 生成 Release 压缩�
 
 | 字段 | 含义 |
 |---|---|
-| `cookie` | 登录态（`MUSIC_U=...` 等），明文保存 |
+| `cookieEnc` | 登录态（`MUSIC_U=...` 等），**DPAPI 加密**保存（base64）；旧版明文 `cookie` 字段自动迁移 |
 | `apiUrl` | 镜像地址，为空则直连 `music.163.com` |
+| `mirrorTokenEnc` | 镜像共享 Token（可选，DPAPI 加密保存；经 `X-NCM-Token` 头发送） |
 | `useProxy` | `true` 走镜像，`false` 直连 |
 | `quality` | 音质档位，默认 `exhigh` |
 | `uid` | 登录账号 ID，拉歌单时自动补全 |
@@ -80,7 +76,12 @@ powershell -ExecutionPolicy Bypass -File release.ps1   # 生成 Release 压缩�
 | `cacheWhitelist` | 白名单歌单 ID（逗号分隔），其缓存永不清理 |
 | `lyricMode` | 歌词注入：`none` 不注入 / `uslt` 流内注入（默认） |
 | `deviceCookie` | 设备指纹 Cookie（首次生成后持久化，仅登录/换 Cookie 时刷新） |
+| `localTokenEnc` | 本地代理访问 Token（随机生成，DPAPI 加密保存；播放列表 URL 携带） |
 | `selectedPlaylists` | 勾选待同步的歌单 ID 数组 |
+
+> 凭据字段（`cookieEnc`/`mirrorTokenEnc`/`localTokenEnc`）使用 Windows DPAPI 加密，
+> 仅当前 Windows 用户可解密；请勿把 `config.json` 复制到其他机器/用户。
+> 若旧版明文配置存在，首次保存时会自动加密迁移。
 
 ## 本地缓存与日志
 
@@ -105,6 +106,17 @@ pip install -r ncm_service/requirements.txt && python ncm_service/app.py
 ```
 
 镜像服务按设计接受 `cookie` 参数，因此只应在本机/可信内网使用，勿暴露公网。
+
+若需部署到公网/多机使用，建议开启共享 Token 鉴权（插件设置页「镜像Token」对应）：
+
+```bash
+NCM_MIRROR_TOKEN=你的随机密钥 node server.js        # Node
+# 或
+NCM_MIRROR_TOKEN=你的随机密钥 python app.py          # Python
+```
+
+开启后所有请求必须携带 `X-NCM-Token` 头（插件自动发送），否则返回 403。
+镜像服务同时只开放插件用到的接口白名单，其余路径一律 404；部署公网请务必加 TLS 反代。
 
 ## 常见问题
 

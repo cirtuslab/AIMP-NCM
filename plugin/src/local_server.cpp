@@ -4,6 +4,7 @@
 #include "local_server.h"
 #include "config.h"
 #include "ncm_client.h"
+#include "ncm_crypto.h"
 #include "utils.h"
 #include "meta_cache.h"
 #include "error_notify.h"
@@ -226,71 +227,109 @@ void HttpClose(HttpGet& g){
     g = {};
 }
 
+// 发起一次 GET 并返回响应; 自动跟随 302/301/303/307/308 重定向(最多 5 跳);
+// TLS 默认严格校验, 证书异常时放宽重试一次(兼容自签镜像/个别 CDN 链)
 bool HttpOpenGet(const std::wstring& url, HttpGet& g, int* outStatus = nullptr){
     if(outStatus) *outStatus = 0;
-    URL_COMPONENTS uc = {}; uc.dwStructSize = sizeof(uc);
-    WCHAR host[256] = {0}, path[2048] = {0};
-    uc.lpszHostName = host; uc.dwHostNameLength = 256;
-    uc.lpszUrlPath  = path; uc.dwUrlPathLength  = 2048;
-    if(!WinHttpCrackUrl(url.c_str(), (DWORD)url.size(), 0, &uc)) return false;
-
-    g.ses = WinHttpOpen(L"AIMP-NCM/1.3", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if(!g.ses) return false;
-    DWORD t = 15000;
-    WinHttpSetOption(g.ses, WINHTTP_OPTION_CONNECT_TIMEOUT, &t, sizeof(t));
-    WinHttpSetOption(g.ses, WINHTTP_OPTION_RECEIVE_TIMEOUT, &t, sizeof(t));
-    WinHttpSetOption(g.ses, WINHTTP_OPTION_RESOLVE_TIMEOUT, &t, sizeof(t));
-
-    g.con = WinHttpConnect(g.ses, uc.lpszHostName, uc.nPort, 0);
-    if(!g.con){ HttpClose(g); return false; }
-    bool https = uc.nScheme == INTERNET_SCHEME_HTTPS;
-    // M2: 默认严格 TLS 证书校验; 证书异常(自签镜像/个别 CDN 链)记日志后仅放宽重试一次,
-    //     不再对全部请求无条件免检(携带登录态的请求可被中间人截获)
-    for(int relax = 0; relax < 2; ++relax){
-        g.req = WinHttpOpenRequest(g.con, L"GET", uc.lpszUrlPath, nullptr,
-                                   WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                   https ? WINHTTP_FLAG_SECURE : 0);
-        if(!g.req){ HttpClose(g); return false; }
-        if(relax){
-            FsLog("HttpOpenGet: TLS cert check failed, retry once with relaxed flags");
-            DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
-                             SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
-            WinHttpSetOption(g.req, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
+    std::wstring current = url;
+    for(int hop = 0; hop < 6; ++hop){
+        URL_COMPONENTS uc = {}; uc.dwStructSize = sizeof(uc);
+        WCHAR host[256] = {0}, path[2048] = {0};
+        uc.lpszHostName = host; uc.dwHostNameLength = 256;
+        uc.lpszUrlPath  = path; uc.dwUrlPathLength  = 2048;
+        if(!WinHttpCrackUrl(current.c_str(), (DWORD)current.size(), 0, &uc)){
+            HttpClose(g);   // 确保不泄漏本跳已打开的句柄
+            return false;
         }
-        WinHttpAddRequestHeaders(g.req,
-            L"User-Agent: AIMP-NCM/1.3\r\nReferer: https://music.163.com\r\n",
-            (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
 
-        if(WinHttpSendRequest(g.req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                              WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-           WinHttpReceiveResponse(g.req, nullptr))
-            break;
+        g.ses = WinHttpOpen(L"AIMP-NCM/1.3", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                            WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if(!g.ses) return false;
+        DWORD t = 15000;
+        WinHttpSetOption(g.ses, WINHTTP_OPTION_CONNECT_TIMEOUT, &t, sizeof(t));
+        WinHttpSetOption(g.ses, WINHTTP_OPTION_RECEIVE_TIMEOUT, &t, sizeof(t));
+        WinHttpSetOption(g.ses, WINHTTP_OPTION_RESOLVE_TIMEOUT, &t, sizeof(t));
 
-        DWORD err = GetLastError();
-        WinHttpCloseHandle(g.req); g.req = nullptr;
-        bool tlsErr = (err == ERROR_WINHTTP_SECURE_FAILURE ||
-                       err == ERROR_WINHTTP_SECURE_CERT_CN_INVALID ||
-                       err == ERROR_WINHTTP_SECURE_CERT_DATE_INVALID ||
-                       err == ERROR_WINHTTP_SECURE_INVALID_CA ||
-                       err == ERROR_WINHTTP_SECURE_INVALID_CERT);
-        if(!tlsErr || relax == 1){ HttpClose(g); return false; }
+        g.con = WinHttpConnect(g.ses, uc.lpszHostName, uc.nPort, 0);
+        if(!g.con){ HttpClose(g); return false; }
+        bool https = uc.nScheme == INTERNET_SCHEME_HTTPS;
+        // M2: 默认严格 TLS 证书校验; 证书异常(自签镜像/个别 CDN 链)记日志后仅放宽重试一次,
+        //     不再对全部请求无条件免检(携带登录态的请求可被中间人截获)
+        bool reqOk = false;
+        for(int relax = 0; relax < 2; ++relax){
+            g.req = WinHttpOpenRequest(g.con, L"GET", uc.lpszUrlPath, nullptr,
+                                       WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                       https ? WINHTTP_FLAG_SECURE : 0);
+            if(!g.req) break;
+            if(relax){
+                FsLog("HttpOpenGet: TLS cert check failed, retry once with relaxed flags");
+                DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                                 SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+                WinHttpSetOption(g.req, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
+            }
+            WinHttpAddRequestHeaders(g.req,
+                L"User-Agent: AIMP-NCM/1.3\r\nReferer: https://music.163.com\r\n",
+                (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+
+            if(WinHttpSendRequest(g.req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                  WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+               WinHttpReceiveResponse(g.req, nullptr)){
+                reqOk = true;
+                break;
+            }
+
+            DWORD err = GetLastError();
+            WinHttpCloseHandle(g.req); g.req = nullptr;
+            bool tlsErr = (err == ERROR_WINHTTP_SECURE_FAILURE ||
+                           err == ERROR_WINHTTP_SECURE_CERT_CN_INVALID ||
+                           err == ERROR_WINHTTP_SECURE_CERT_DATE_INVALID ||
+                           err == ERROR_WINHTTP_SECURE_INVALID_CA ||
+                           err == ERROR_WINHTTP_SECURE_INVALID_CERT);
+            if(!tlsErr || relax == 1) break;
+        }
+        if(!reqOk){ HttpClose(g); return false; }
+
+        DWORD status = 0, sz = sizeof(status);
+        WinHttpQueryHeaders(g.req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            nullptr, &status, &sz, nullptr);
+        if(outStatus) *outStatus = (int)status;
+
+        bool redirect = status == 301 || status == 302 || status == 303 ||
+                        status == 307 || status == 308;
+        if(!redirect){
+            if(status != 200 && status != 206){
+                NcmErrorNotifyAccess((int)status);   // 403/429 等访问受限弹窗警告
+                HttpClose(g); return false;
+            }
+            WCHAR ct[128] = {0}; DWORD ctLen = sizeof(ct);
+            if(WinHttpQueryHeaders(g.req, WINHTTP_QUERY_CONTENT_TYPE, nullptr, ct, &ctLen, nullptr))
+                g.contentType.assign(ct, ctLen / sizeof(WCHAR));
+            DWORD len = 0; sz = sizeof(len);
+            if(WinHttpQueryHeaders(g.req, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+                                   nullptr, &len, &sz, nullptr)) g.total = (long long)len;
+            return true;
+        }
+        if(hop == 5){ HttpClose(g); return false; }   // 超过 5 跳: 放弃
+        WCHAR loc[2048] = {0}; DWORD locLen = sizeof(loc);
+        if(!WinHttpQueryHeaders(g.req, WINHTTP_QUERY_LOCATION, nullptr, loc, &locLen, nullptr)){
+            HttpClose(g); return false;
+        }
+        // Location 可能是相对路径: 补全为绝对 URL 再进入下一跳
+        std::wstring next(loc);
+        if(!next.empty() && next.rfind(L"//", 0) == 0){
+            next = (https ? L"https:" : L"http:") + next;   // 协议相对: //host/path
+        } else if(!next.empty() && next[0] == L'/'){
+            next = (https ? L"https://" : L"http://") + std::wstring(host) + next;
+        } else if(next.find(L"://") == std::wstring::npos){
+            size_t q = current.find(L'?');
+            std::wstring base = q == std::wstring::npos ? current : current.substr(0, q);
+            size_t slash = base.find_last_of(L'/');
+            next = (slash == std::wstring::npos ? current : base.substr(0, slash + 1)) + next;
+        }
+        HttpClose(g);   // 释放旧句柄, 下一跳重开
+        current = next;
     }
-    DWORD status = 0, sz = sizeof(status);
-    WinHttpQueryHeaders(g.req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                        nullptr, &status, &sz, nullptr);
-    if(outStatus) *outStatus = (int)status;
-    if(status != 200 && status != 206){
-        NcmErrorNotifyAccess((int)status);   // 403/429 等访问受限弹窗警告
-        HttpClose(g); return false;
-    }
-    WCHAR ct[128] = {0}; DWORD ctLen = sizeof(ct);
-    if(WinHttpQueryHeaders(g.req, WINHTTP_QUERY_CONTENT_TYPE, nullptr, ct, &ctLen, nullptr))
-        g.contentType.assign(ct, ctLen / sizeof(WCHAR));
-    DWORD len = 0; sz = sizeof(len);
-    if(WinHttpQueryHeaders(g.req, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
-                           nullptr, &len, &sz, nullptr)) g.total = (long long)len;
-    return true;
+    return false;
 }
 
 int HttpRead(HttpGet& g, char* buf, int len){
@@ -486,6 +525,35 @@ struct ConnCloser {
     }
 };
 
+// ---- 本地代理鉴权 ----
+// 播放列表条目形如 http://127.0.0.1:{port}/x/{token}/{pid}/{tid}.mp3,
+// token 段用于防止本机其他进程(恶意网页/文档)直接借用代理拉流。
+// 校验失败统一返回 403, 不泄露任何内部信息。
+bool AuthTokenOk(const std::string& path){
+    NcmConfig cfg; ConfigManager::Load(cfg);
+    if(cfg.localToken.empty()) return true;   // 未设置 token: 保持旧行为(兼容老配置)
+    // 期望路径: /x/{token}/{pid}/{tid}
+    const std::string kPrefix = "/x/";
+    if(path.rfind(kPrefix, 0) != 0) return false;
+    std::string rest = path.substr(kPrefix.size());
+    size_t slash = rest.find('/');
+    if(slash == std::string::npos) return false;
+    std::string tok = rest.substr(0, slash);
+    return tok == WideToUtf8(cfg.localToken);
+}
+// 去掉路径中的 token 段, 得到 /{pid}/{tid} 形式; 未设置 token 时路径即原样
+bool StripTokenPath(const std::string& path, std::string& out){
+    NcmConfig cfg; ConfigManager::Load(cfg);
+    if(cfg.localToken.empty()){ out = path; return true; }
+    const std::string kPrefix = "/x/";
+    if(path.rfind(kPrefix, 0) != 0) return false;
+    std::string rest = path.substr(kPrefix.size());
+    size_t slash = rest.find('/');
+    if(slash == std::string::npos) return false;
+    out = "/" + rest.substr(slash + 1);
+    return true;
+}
+
 void HandleClientInner(SOCKET s){
     // H1: 循环 recv 直到请求头结束(\r\n\r\n)或缓冲区满, 防止 TCP 分段(如只收到 "GE")
     //     被当成完整请求解析; 加收超时, 防慢速连接长期占用连接线程
@@ -518,6 +586,16 @@ void HandleClientInner(SOCKET s){
     }
     if(path.empty() || path[0] != '/'){
         SendAll(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
+    }
+
+    // 鉴权: 未设置 token 时放行(兼容旧版播放列表条目); 否则路径必须带正确 token 段
+    if(!AuthTokenOk(path)){
+        SendAll(s, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
+    }
+    if(!StripTokenPath(path, path)){
+        SendAll(s, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return;
     }
 
@@ -659,6 +737,14 @@ void RunCleanupNow(){
 bool Start(int preferredPort, int* boundPort){
     std::lock_guard<std::mutex> lk(g_srvMtx);   // B3: Start/Stop 互斥
     if(g_run){ if(boundPort) *boundPort = g_boundPort; return true; }
+    // 本地代理 token: 首次启动时自动生成并持久化(防止本机其他进程借用代理)
+    {
+        NcmConfig cfg; ConfigManager::Load(cfg);
+        if(cfg.localToken.empty()){
+            cfg.localToken = Utf8ToWide(NcmCrypto::RandomString(24));
+            ConfigManager::Save(cfg);
+        }
+    }
     WSADATA wsa;
     if(WSAStartup(MAKEWORD(2,2), &wsa) != 0) return false;
     g_listen = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);

@@ -6,14 +6,36 @@
 #include <shlwapi.h>
 #include <fstream>
 #include <mutex>
+#include <cstring>
 #pragma comment(lib, "shlwapi.lib")
 
 // ---- 诊断日志: %TEMP%\aimp_ncm\logs\aimp_ncm_fs.log ----
 // D5: 单文件 3MB 上限; 超限滚动为 aimp_ncm_fs-<时间戳>.log; 自动删除 7 天前的滚动日志
+// 敏感信息(登录 Cookie / 镜像 Token / 本地代理 token)统一脱敏后再写日志
 namespace {
 std::mutex g_logMtx;
 const ULONGLONG kLogMaxBytes = 3ull * 1024 * 1024;
 const ULONGLONG kLogKeepMs   = 7ull * 24 * 3600 * 1000;
+
+// 把串中所有敏感键值替换为 <redacted>
+std::string RedactSecret(const std::string& s){
+    std::string out = s;
+    const char* keys[] = {"MUSIC_U=", "cookie=", "X-NCM-Token:", "localToken", "mirrorToken"};
+    for(const char* k : keys){
+        size_t pos = 0;
+        while((pos = out.find(k, pos)) != std::string::npos){
+            // 值起点: 跳过键后的空白(如 "X-NCM-Token: xxx")
+            size_t v = pos + strlen(k);
+            while(v < out.size() && (out[v] == ' ' || out[v] == '\t')) ++v;
+            // 值到行尾/分号/空白为止
+            size_t end = out.find_first_of(";\r\n \"", v);
+            if(end == std::string::npos) end = out.size();
+            out.replace(v, end - v, "<redacted>");
+            pos = v + 10;
+        }
+    }
+    return out;
+}
 }
 void FsLog(const char* what){
     WCHAR tmp[MAX_PATH]={0};
@@ -48,7 +70,7 @@ void FsLog(const char* what){
     SYSTEMTIME st; GetLocalTime(&st);
     char buf[40];
     sprintf_s(buf, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    f << buf << what << "\n";
+    f << buf << RedactSecret(what) << "\n";
     f.flush();
 
     // 自动删除 7 天前的滚动日志
@@ -280,19 +302,32 @@ bool NcmFileSystem::ParseStreamUri(const std::wstring& uri, long long& pid, long
         try{ pid = std::stoll(rest.substr(0, slash)); tid = std::stoll(tidStr); return tid > 0; }
         catch(...){ return false; }
     }
-    // http://127.0.0.1:{port}/{pid}/{tid}.{ext} (仅环回主机)
+    // http://127.0.0.1:{port}/{pid}/{tid}.{ext} 或 http://127.0.0.1:{port}/x/{token}/{pid}/{tid}.{ext} (仅环回主机)
     size_t scheme = uri.find(L"://");
     if(scheme == std::wstring::npos) return false;
     size_t hostEnd = uri.find(L'/', scheme + 3);
     if(hostEnd == std::wstring::npos) return false;
-    if(uri.compare(scheme + 3, 9, L"127.0.0.1") != 0) return false;
-    size_t slash2 = uri.find(L'/', hostEnd + 1);
+    // 主机必须恰好是 127.0.0.1(后跟 ':' 端口或直接 '/' ), 防止 127.0.0.1.evil.com 绕过
+    {
+        std::wstring host = uri.substr(scheme + 3, hostEnd - (scheme + 3));
+        size_t colon = host.find(L':');
+        if(colon != std::wstring::npos) host = host.substr(0, colon);
+        if(host != L"127.0.0.1") return false;
+    }
+    std::wstring rest = uri.substr(hostEnd + 1);
+    // 去掉可选的 x/{token}/ 前缀(不校验 token 值, 仅解析; 鉴权由本地代理执行)
+    if(rest.rfind(L"x/", 0) == 0){
+        size_t slash = rest.find(L'/');
+        if(slash != std::wstring::npos) rest = rest.substr(slash + 1);
+        else return false;
+    }
+    size_t slash2 = rest.find(L'/');
     if(slash2 == std::wstring::npos) return false;
-    std::wstring tidStr = uri.substr(slash2 + 1);
+    std::wstring tidStr = rest.substr(slash2 + 1);
     size_t dot = tidStr.find(L'.');
     if(dot != std::wstring::npos) tidStr = tidStr.substr(0, dot);
     try{
-        pid = std::stoll(uri.substr(hostEnd + 1, slash2 - hostEnd - 1));
+        pid = std::stoll(rest.substr(0, slash2));
         tid = std::stoll(tidStr);
         return pid > 0 && tid > 0;
     }catch(...){ return false; }

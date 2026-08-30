@@ -171,7 +171,7 @@ static std::string GenNtesNuid(){
 
 NcmClient::NcmClient(const NcmConfig& cfg): cfg_(cfg) {}
 
-std::string NcmClient::RequestMirror(const std::wstring& path, const std::string& jsonData, bool post){
+std::string NcmClient::RequestMirror(const std::wstring& path, const std::string& jsonData, bool post, int* outStatus){
     std::wstring base = cfg_.apiUrl;
     if(!base.empty() && base.back()==L'/') base.pop_back();
     std::wstring url = base + path;
@@ -195,7 +195,15 @@ std::string NcmClient::RequestMirror(const std::wstring& path, const std::string
         std::string cenc = HttpClient::UrlEncodeW(cfg_.cookie);
         body += "cookie=" + cenc;
     }
-    auto resp = HttpClient::Post(url, body, L"", L"");
+    // 共享 Token 经请求头发送, 避免出现在 URL/日志中;
+    // 防御头注入: 仅允许不含 CR/LF 的 token(配置被手动编辑时兜底)
+    std::wstring headers;
+    if(!cfg_.mirrorToken.empty() &&
+       cfg_.mirrorToken.find(L'\r') == std::wstring::npos &&
+       cfg_.mirrorToken.find(L'\n') == std::wstring::npos)
+        headers = L"X-NCM-Token: " + cfg_.mirrorToken;
+    auto resp = HttpClient::Post(url, body, headers, L"");
+    if(outStatus) *outStatus = resp.status;
     return resp.body;
 }
 std::string NcmClient::RequestDirect(const std::wstring& uriPath, const std::string& jsonData, bool useEapi){
@@ -288,11 +296,8 @@ bool NcmClient::GetAccountId(long long& uid){
     uid = 0;
     std::string resp;
     if(cfg_.useProxy && !cfg_.apiUrl.empty()){
-        std::wstring base = cfg_.apiUrl;
-        if(!base.empty() && base.back()==L'/') base.pop_back();
-        std::wstring url = base + L"/user/account";
-        if(!cfg_.cookie.empty()) url += L"?cookie=" + Utf8ToWide(HttpClient::UrlEncodeW(cfg_.cookie));
-        resp = HttpClient::Get(url).body;
+        // cookie 走 POST body + X-NCM-Token 头, 不落 URL
+        resp = RequestMirror(L"/user/account", "{}");
     } else {
         resp = RequestDirect(L"/api/nuser/account/get", "{}");
     }
@@ -341,15 +346,14 @@ bool NcmClient::GetPlaylistDetail(long long pid, std::vector<NcmSong>& outSongs,
     if(info) *info = NcmPlaylist();
 
     if(cfg_.useProxy && !cfg_.apiUrl.empty()){
-        // 镜像: /playlist/track/all 按 1000/页 offset 分页拉取
+        // 镜像: /playlist/track/all 按 1000/页 offset 分页拉取 (cookie 走 POST body, 不落 URL)
         long long offset = 0;
         for(;;){
-            std::wstring url = cfg_.apiUrl + L"/playlist/track/all?id=" + std::to_wstring(pid) +
-                               L"&limit=1000&offset=" + std::to_wstring(offset);
-            if(!cfg_.cookie.empty()) url += L"&cookie=" + Utf8ToWide(HttpClient::UrlEncodeW(cfg_.cookie));
-            auto r = HttpClient::Get(url);
+            json q;
+            q["id"] = pid; q["limit"] = 1000; q["offset"] = offset;
+            auto resp = RequestMirror(L"/playlist/track/all", q.dump());
             try{
-                auto js = json::parse(r.body);
+                auto js = json::parse(resp);
                 json songs;
                 if(js.contains("songs")) songs = js["songs"];
                 else if(js.contains("body") && js["body"].contains("songs")) songs = js["body"]["songs"];
@@ -471,11 +475,10 @@ bool NcmClient::GetSongUrlLevel(long long id, const std::string& levelUtf8, std:
     std::string resp;
     int httpStatus = 0;   // 诊断: 记录最近一次 HTTP 状态
     if(cfg_.useProxy && !cfg_.apiUrl.empty()){
-        std::wstring url = cfg_.apiUrl + L"/song/url/v1?id=" + std::to_wstring(id) + L"&level=" + Utf8ToWide(level);
-        if(!cfg_.cookie.empty()) url += L"&cookie=" + Utf8ToWide(HttpClient::UrlEncodeW(cfg_.cookie));
-        auto r=HttpClient::Get(url);
-        httpStatus = r.status;
-        resp=r.body;
+        // cookie 走 POST body + X-NCM-Token 头, 不落 URL
+        json q;
+        q["id"] = id; q["level"] = level;
+        resp = RequestMirror(L"/song/url/v1", q.dump(), true, &httpStatus);
     } else {
         resp = RequestDirect(L"/api/song/enhance/player/url/v1", j.dump(), true);
     }

@@ -137,15 +137,36 @@ def api_playlist_track_all(pid, limit=1000, offset=0, cookie=""):
     return {"songs": songs, "playlist": playlist}
 
 # ---------- HTTP 服务 ----------
+# 仅监听回环地址; 不发送 CORS 头(禁止浏览器跨域借用);
+# 可选共享 Token: 设置环境变量 NCM_MIRROR_TOKEN 后, 请求必须带 X-NCM-Token 头
+MIRROR_TOKEN = os.environ.get("NCM_MIRROR_TOKEN", "")
+ALLOWED_PATHS = {
+    "login/qr/key", "login/qr/check", "user/playlist", "playlist/track/all",
+    "song/url/v1", "song/detail", "lyric", "user/account",
+}
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def _dispatch(self, q):
+        path = q.pop("_path","")
+        if path not in ALLOWED_PATHS:
+            self.send_response(404)
+            self.send_header("Content-Type","application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps({"code":404,"msg":"not found: "+path}).encode())
+            return
+        if MIRROR_TOKEN:
+            if self.headers.get("X-NCM-Token") != MIRROR_TOKEN:
+                self.send_response(403)
+                self.send_header("Content-Type","application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(json.dumps({"code":403,"msg":"forbidden: bad or missing X-NCM-Token"}).encode())
+                return
         self.send_response(200)
         self.send_header("Content-Type","application/json; charset=utf-8")
         # M5: 不发送通配 CORS 头 —— 本服务只面向本机插件(WinHTTP 客户端, 不受 CORS 约束),
         #     开放跨域会让任意网页(含 DNS rebinding)把本机当作访问网易云的匿名中转
         self.end_headers()
         try:
-            path = q.pop("_path","")
             if path=="login/qr/key":
                 r=api_login_qr_key(q.get("cookie",""))
             elif path=="login/qr/check":

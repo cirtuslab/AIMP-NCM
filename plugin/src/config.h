@@ -4,8 +4,9 @@
 #include <windows.h>
 
 struct NcmConfig {
-    std::wstring cookie;          // MUSIC_U + __csrf etc
+    std::wstring cookie;          // MUSIC_U + __csrf etc (DPAPI 加密落盘)
     std::wstring apiUrl = L""; // 代理镜像地址，可选；为空则直连 music.163.com
+    std::wstring mirrorToken;     // 镜像服务共享 Token(可选, DPAPI 加密落盘; 请求时经 X-NCM-Token 头发送)
     std::wstring quality = L"exhigh"; // standard/higher/exhigh/lossless/hires/jymaster/jyeffect/sky
     std::vector<long long> selectedPlaylists; // playlist ids
     bool useProxy = false; // true 时走 apiUrl 代理，false 时直连 (默认直连，代理可选)
@@ -15,6 +16,7 @@ struct NcmConfig {
     std::wstring cacheWhitelist; // 白名单歌单ID(逗号分隔), 其歌曲缓存永不删除
     std::wstring lyricMode = L"uslt"; // none=不注入歌词 / uslt=流内注入 USLT 歌词帧(已验证 mp3/flac/wav)
     std::wstring deviceCookie;   // 设备指纹 Cookie(首次生成后持久化, 仅登录/换 Cookie 时刷新)
+    std::wstring localToken;     // 本地代理访问 token(随机生成, DPAPI 加密落盘; 播放列表 URL 携带)
 };
 
 class ConfigManager {

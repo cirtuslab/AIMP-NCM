@@ -44,6 +44,6 @@ private:
     NcmConfig cfg_;
     std::wstring deviceId_;  // 持久化的设备伪装 Cookie
     void EnsureDeviceCookie();
-    std::string RequestMirror(const std::wstring& path, const std::string& jsonData, bool post=true);
+    std::string RequestMirror(const std::wstring& path, const std::string& jsonData, bool post=true, int* outStatus=nullptr);
     std::string RequestDirect(const std::wstring& uriPath, const std::string& jsonData, bool useEapi=false);
 };

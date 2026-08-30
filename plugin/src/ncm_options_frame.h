@@ -52,6 +52,7 @@ private:
     static void OnProxyToggled(NcmOptionsFrame* self);
     static void OnApiChanged(NcmOptionsFrame* self);
     static void OnCookieChanged(NcmOptionsFrame* self);
+    static void OnTokenChanged(NcmOptionsFrame* self){ self->SaveConfig(true); }
     static void OnQualityChanged(NcmOptionsFrame* self);
     static void OnTestClicked(NcmOptionsFrame* self);
     static void OnRefreshClicked(NcmOptionsFrame* self);
@@ -91,6 +92,7 @@ private:
     IAIMPUICheckBox* chkProxy_ = nullptr;
     IAIMPUIWinControl* eApi_ = nullptr;
     IAIMPUIButton* btnTest_ = nullptr;
+    IAIMPUIWinControl* eToken_ = nullptr;
     IAIMPUIWinControl* eCookie_ = nullptr;
     IAIMPUIWinControl* st_ = nullptr;
     IAIMPUIWinControl* cbo_ = nullptr;
