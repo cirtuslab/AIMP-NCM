@@ -1,4 +1,4 @@
-﻿#include "ncm_client.h"
+#include "ncm_client.h"
 #include "http_client.h"
 #include "ncm_crypto.h"
 #include "utils.h"
@@ -349,7 +349,7 @@ std::wstring NcmClient::BuildDeviceCookie(){
     // 初始化/补全设备 Cookie
     // 参考 NeteaseCloudMusicApiEnhanced processCookieObject + go-musicfox
     // M5: 不再用 srand/rand(会污染宿主进程 AIMP 的全局随机状态),
-    //     随机源统一走 NcmCrypto::RandomString(mt19937+random_device)
+    //     随机源统一走 NcmCrypto::RandomString(BCryptGenRandom)
     std::wstring deviceId_;
     if(deviceId_.empty()){
         deviceId_ = L"os=pc; appver=2.7.1.198277; osver=10; __remember_me=true; "

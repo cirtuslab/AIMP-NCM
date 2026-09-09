@@ -9,6 +9,8 @@
 #pragma comment(lib, "crypt32.lib")
 using json = nlohmann::json;
 
+void FsLog(const char* what);   // filesystem.cpp; DPAPI 失败诊断
+
 // M1: 设置页(主线程)、播放连接线程、后台任务线程都会 Load/Save 配置:
 //     1) 全部读写走同一把互斥锁, 避免并发读到截断的 JSON 或互相覆盖;
 //     2) 落盘先写 .tmp 再原子替换(D4 方案, 此前 config.json 未纳入);
@@ -128,7 +130,8 @@ void SaveSecret(json& j, const char* encField, const char* plainField, const std
         j[encField] = blob.empty() ? "" : Base64Encode(blob);
         j[plainField] = "";    // 清理旧明文
     } else {
-        // DPAPI 失败(极少见): 回退明文并保留旧字段, 保证配置仍可用
+        // DPAPI 失败(极少见): 回退明文并保留旧字段, 保证配置仍可用; 必须留下痕迹
+        FsLog(("SaveSecret: DPAPI failed, fallback plaintext field=" + std::string(plainField)).c_str());
         j[plainField] = plain;
         j[encField] = "";
     }
@@ -168,7 +171,7 @@ NcmConfig ParseConfig(const json& j){
     cfg.cacheDays = j.value("cacheDays", 7);
     cfg.cacheWhitelist = Utf8ToWide(j.value("cacheWhitelist",""));
     cfg.lyricMode = Utf8ToWide(j.value("lyricMode","uslt"));
-    cfg.deviceCookie = Utf8ToWide(j.value("deviceCookie",""));
+    cfg.deviceCookie = LoadSecret(j, "deviceCookieEnc", "deviceCookie");
     cfg.localToken = LoadSecret(j, "localTokenEnc", "localToken");
     cfg.selectedPlaylists.clear();
     if (j.contains("selectedPlaylists") && j["selectedPlaylists"].is_array()) {
@@ -188,7 +191,7 @@ json DumpConfig(const NcmConfig& cfg){
     j["cacheDays"] = cfg.cacheDays;
     j["cacheWhitelist"] = WideToUtf8(cfg.cacheWhitelist);
     j["lyricMode"] = WideToUtf8(cfg.lyricMode);
-    j["deviceCookie"] = WideToUtf8(cfg.deviceCookie);
+    SaveSecret(j, "deviceCookieEnc", "deviceCookie", cfg.deviceCookie);
     SaveSecret(j, "localTokenEnc", "localToken", cfg.localToken);
     j["selectedPlaylists"] = cfg.selectedPlaylists;
     return j;

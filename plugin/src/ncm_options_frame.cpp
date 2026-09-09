@@ -759,12 +759,17 @@ void NcmOptionsFrame::ImportPlaylist(const std::wstring& m3u, int total){
                 if(path){
                     pl->BeginUpdate();
                     pl->DeleteAll();
-                    hrAdd = pl->Add(path, 0, -1);
+                    // NOTHREADING: 同步展开 m3u8。Add 默认后台线程解析播放列表,
+                    // 若在此之后立刻删文件, AIMP 只会留下 "ncm_playlist.m3u8 <not found>"。
+                    hrAdd = pl->Add(path, AIMP_PLAYLIST_ADD_FLAGS_NOTHREADING, -1);
                     pl->EndUpdate();
                     path->Release();
                 }
+                // 不再删除 ncm_playlist.m3u8: AIMP 播放列表可能仍引用该路径;
+                // 文件中的本地代理 token 与播放列表内部 URL 等价, 见 README 风险说明。
                 wchar_t b[128];
-                if(SUCCEEDED(hrAdd)) swprintf_s(b, L"已同步 %d 首到播放列表「网易云串流」(本地代理, 播放时实时取链)", total);
+                if(SUCCEEDED(hrAdd))
+                    swprintf_s(b, L"已同步 %d 首到播放列表「网易云串流」(本地代理, 播放时实时取链)", total);
                 else swprintf_s(b, L"同步失败 (Add 0x%08X)", (unsigned)hrAdd);
                 ShowStatus(b);
             } else {

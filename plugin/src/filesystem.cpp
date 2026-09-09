@@ -100,10 +100,12 @@ HRESULT NcmFileSystem::QueryInterface(REFIID riid, void** ppv){
     if(!ppv) return E_POINTER;
     *ppv=nullptr;
     // FsLogGuid("QI", riid);  // 导入时查询量大, 需要时再打开
+    // 必须连成一条 if/else 链: 此前 DropSource 前误用独立 if, 会导致
+    // IUnknown/IExtensionFileSystem 命中后仍落入末尾 else 而返回 E_NOINTERFACE。
     if(IsEqualIID(riid, IID_IUnknown)) *ppv=static_cast<IUnknown*>(static_cast<IAIMPExtensionFileSystem*>(this));
     else if(IsEqualIID(riid, IID_IAIMPPropertyList)) *ppv=static_cast<IAIMPPropertyList*>(static_cast<IAIMPExtensionFileSystem*>(this));
     else if(IsEqualIID(riid, IID_IAIMPExtensionFileSystem)) *ppv=static_cast<IAIMPExtensionFileSystem*>(this);
-    if(IsEqualIID(riid, IID_IAIMPFileSystemCommandDropSource)) *ppv=static_cast<IAIMPFileSystemCommandDropSource*>(this);
+    else if(IsEqualIID(riid, IID_IAIMPFileSystemCommandDropSource)) *ppv=static_cast<IAIMPFileSystemCommandDropSource*>(this);
     else if(IsEqualIID(riid, IID_IAIMPFileSystemCommandStreaming)) *ppv=static_cast<IAIMPFileSystemCommandStreaming*>(this);
     else if(IsEqualIID(riid, IID_IAIMPFileSystemCommandFileInfo)) *ppv=static_cast<IAIMPFileSystemCommandFileInfo*>(this);
     else if(IsEqualIID(riid, IID_IAIMPExtensionFileInfoProvider)) *ppv=static_cast<IAIMPExtensionFileInfoProvider*>(this);

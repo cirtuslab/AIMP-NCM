@@ -1,4 +1,5 @@
 #include "meta_cache.h"
+#include "config.h"
 #include "utils.h"
 #include "error_notify.h"
 #include <cstring>
@@ -68,7 +69,7 @@ bool HttpDownloadBytes(const std::wstring& url, std::string& out){
     uc.lpszUrlPath  = path; uc.dwUrlPathLength  = 2048;
     if(!WinHttpCrackUrl(url.c_str(), (DWORD)url.size(), 0, &uc)) return false;
 
-    HINTERNET ses = WinHttpOpen(L"AIMP-NCM/1.3", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+    HINTERNET ses = WinHttpOpen(L"AIMP-NCM/1.5", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if(!ses) return false;
     DWORD t = 10000;
@@ -79,14 +80,18 @@ bool HttpDownloadBytes(const std::wstring& url, std::string& out){
     bool ok = false;
     if(con){
         bool https = uc.nScheme == INTERNET_SCHEME_HTTPS;
-        // M2: 默认严格 TLS 证书校验; 证书异常(自签镜像/个别 CDN 链)记日志后仅放宽重试一次
-        for(int relax = 0; relax < 2; ++relax){
+        // M2: 默认严格 TLS; 仅用户配置的镜像 host 允许证书放宽一次(封面/歌词下载)
+        NcmConfig tlsCfg;
+        ConfigManager::Load(tlsCfg);
+        const bool allowRelax = https && HostAllowsTlsRelax(uc.lpszHostName, tlsCfg.apiUrl);
+        const int maxRelax = allowRelax ? 1 : 0;
+        for(int relax = 0; relax <= maxRelax; ++relax){
             req = WinHttpOpenRequest(con, L"GET", uc.lpszUrlPath, nullptr,
                                      WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
                                      https ? WINHTTP_FLAG_SECURE : 0);
             if(!req) break;
             if(relax){
-                FsLog("HttpDownloadBytes: TLS cert check failed, retry once with relaxed flags");
+                FsLog("HttpDownloadBytes: mirror TLS cert check failed, retry once with relaxed flags");
                 DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
                                  SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
                 WinHttpSetOption(req, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
@@ -102,7 +107,8 @@ bool HttpDownloadBytes(const std::wstring& url, std::string& out){
                            err == ERROR_WINHTTP_SECURE_CERT_DATE_INVALID ||
                            err == ERROR_WINHTTP_SECURE_INVALID_CA ||
                            err == ERROR_WINHTTP_SECURE_INVALID_CERT);
-            if(!tlsErr || relax == 1) break;
+            // 仅镜像允许第二次(放宽)尝试; 非 TLS 或已用尽次数则结束
+            if(!tlsErr || relax >= maxRelax) break;
         }
         if(req){
             DWORD status = 0, statusLen = sizeof(status);

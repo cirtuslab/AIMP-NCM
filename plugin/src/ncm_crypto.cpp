@@ -13,13 +13,14 @@ static const char* BASE62 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXY
 std::string NcmCrypto::RandomString(int len){
     // 密码学安全随机: BCryptGenRandom(会话密钥/设备指纹), 不使用 mt19937 等可预测 PRNG;
     // 用拒绝采样消除模偏差(256 不是 62 的倍数)
+    if(len <= 0) return "";
     std::string s; s.reserve(len);
     BYTE buf[64];
     int left = len;
     while(left > 0){
         int chunk = left > 64 ? 64 : left;
         if(BCryptGenRandom(nullptr, buf, chunk, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
-            break;   // 失败时退化为当前时间+计数器(仅设备指纹场景, 不用于会话密钥)
+            break;   // 系统 RNG 失败: 不再用 GetTickCount 等可预测源补齐
         for(int i=0;i<chunk;i++){
             unsigned v = buf[i];
             if(v >= 248) continue;   // 拒绝 248..255, 保证均匀
@@ -27,7 +28,7 @@ std::string NcmCrypto::RandomString(int len){
         }
         left = len - (int)s.size();
     }
-    while((int)s.size() < len) s += BASE62[(GetTickCount() + (unsigned)s.size()) % 62];
+    // 长度不足说明 CSPRNG 失败: 返回已生成前缀(可能短于 len), 调用方应检查空串/长度
     return s;
 }
 std::string NcmCrypto::Base64Encode(const std::string& s){
@@ -188,6 +189,8 @@ fallback:
 }
 WeapiResult NcmCrypto::Weapi(const std::string& jsonText){
     std::string sec = RandomString(16);
+    // CSPRNG 失败时 RandomString 可能短于 16; 不可用短密钥做 AES
+    if(sec.size() != 16) return {"", ""};
     std::string enc1 = AesEncryptCbc(jsonText, PRESET_KEY, IV);
     std::string enc2 = AesEncryptCbc(enc1, sec, IV);
     std::string rev = sec; std::reverse(rev.begin(), rev.end());

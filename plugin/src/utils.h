@@ -57,3 +57,51 @@ inline IAIMPString* WStringToAimpString(IAIMPCore* core, const std::wstring& w) 
     }
     return nullptr;
 }
+
+// 恒定时间字符串比较(长度仍会泄露, 本机 token 场景可接受)
+inline bool SecureEquals(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    unsigned char diff = 0;
+    for (size_t i = 0; i < a.size(); ++i)
+        diff |= (unsigned char)a[i] ^ (unsigned char)b[i];
+    return diff == 0;
+}
+inline bool SecureEqualsW(const std::wstring& a, const std::wstring& b) {
+    if (a.size() != b.size()) return false;
+    unsigned int diff = 0;
+    for (size_t i = 0; i < a.size(); ++i)
+        diff |= (unsigned int)a[i] ^ (unsigned int)b[i];
+    return diff == 0;
+}
+
+// 从 URL 或裸 host 提取主机名(小写); 不依赖 WinHTTP, 避免重复 crack
+inline std::wstring UrlHostName(const std::wstring& urlOrHost) {
+    if (urlOrHost.empty()) return L"";
+    size_t start = 0;
+    size_t scheme = urlOrHost.find(L"://");
+    if (scheme != std::wstring::npos) start = scheme + 3;
+    size_t end = urlOrHost.find_first_of(L"/?#", start);
+    std::wstring hostport = urlOrHost.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
+    size_t at = hostport.rfind(L'@');
+    if (at != std::wstring::npos) hostport = hostport.substr(at + 1);
+    // IPv6 字面量 [2001:db8::1]:443 —— 先剥方括号再处理端口, 否则会按第一个冒号截断
+    if (!hostport.empty() && hostport[0] == L'[') {
+        size_t br = hostport.find(L']');
+        hostport = (br == std::wstring::npos) ? hostport.substr(1) : hostport.substr(1, br - 1);
+    } else {
+        size_t colon = hostport.find(L':');
+        if (colon != std::wstring::npos) hostport = hostport.substr(0, colon);
+    }
+    for (auto& c : hostport) {
+        if (c >= L'A' && c <= L'Z') c = (wchar_t)(c - L'A' + L'a');
+    }
+    return hostport;
+}
+
+// 仅允许对用户配置的镜像 host 放宽 TLS; 网易云/CDN 等一律禁止降级
+inline bool HostAllowsTlsRelax(const std::wstring& host, const std::wstring& apiUrl) {
+    if (apiUrl.empty() || host.empty()) return false;
+    std::wstring mirror = UrlHostName(apiUrl);
+    if (mirror.empty()) return false;
+    return mirror == UrlHostName(host);
+}

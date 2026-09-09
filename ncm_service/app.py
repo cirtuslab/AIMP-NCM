@@ -8,7 +8,7 @@ AIMP NCM Python 侧载服务（零依赖，仅标准库 + requests）
 启动: python app.py  (默认 http://localhost:3000)
 生成播放列表: python app.py --sync --cookie "MUSIC_U=xxx; __csrf=xxx" --quality exhigh --output playlist.m3u8
 """
-import http.server, urllib.parse, json, os, sys, argparse, time, random
+import http.server, urllib.parse, json, os, sys, argparse, time, random, hmac
 try:
     import requests
 except ImportError:
@@ -155,7 +155,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"code":404,"msg":"not found: "+path}).encode())
             return
         if MIRROR_TOKEN:
-            if self.headers.get("X-NCM-Token") != MIRROR_TOKEN:
+            # compare_digest 对非 ASCII 的 str 会抛 TypeError; 统一按 bytes 比较
+            got = (self.headers.get("X-NCM-Token") or "").encode("utf-8", "ignore")
+            if not hmac.compare_digest(got, MIRROR_TOKEN.encode("utf-8")):
                 self.send_response(403)
                 self.send_header("Content-Type","application/json; charset=utf-8")
                 self.end_headers()

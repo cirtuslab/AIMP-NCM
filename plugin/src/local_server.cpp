@@ -1,4 +1,4 @@
-﻿// winsock2 must be included before windows.h (pulled in by config.h)
+// winsock2 must be included before windows.h (pulled in by config.h)
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include "local_server.h"
@@ -228,7 +228,7 @@ void HttpClose(HttpGet& g){
 }
 
 // 发起一次 GET 并返回响应; 自动跟随 302/301/303/307/308 重定向(最多 5 跳);
-// TLS 默认严格校验, 证书异常时放宽重试一次(兼容自签镜像/个别 CDN 链)
+// TLS 默认严格校验; 仅配置的镜像 host 证书异常时放宽重试一次
 bool HttpOpenGet(const std::wstring& url, HttpGet& g, int* outStatus = nullptr){
     if(outStatus) *outStatus = 0;
     std::wstring current = url;
@@ -242,7 +242,7 @@ bool HttpOpenGet(const std::wstring& url, HttpGet& g, int* outStatus = nullptr){
             return false;
         }
 
-        g.ses = WinHttpOpen(L"AIMP-NCM/1.3", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        g.ses = WinHttpOpen(L"AIMP-NCM/1.5", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                             WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if(!g.ses) return false;
         DWORD t = 15000;
@@ -253,22 +253,26 @@ bool HttpOpenGet(const std::wstring& url, HttpGet& g, int* outStatus = nullptr){
         g.con = WinHttpConnect(g.ses, uc.lpszHostName, uc.nPort, 0);
         if(!g.con){ HttpClose(g); return false; }
         bool https = uc.nScheme == INTERNET_SCHEME_HTTPS;
-        // M2: 默认严格 TLS 证书校验; 证书异常(自签镜像/个别 CDN 链)记日志后仅放宽重试一次,
-        //     不再对全部请求无条件免检(携带登录态的请求可被中间人截获)
+        // M2: 默认严格 TLS; 仅用户配置的镜像 host 允许证书放宽一次。
+        //     CDN/网易云域名禁止降级，避免被中间人替换音频或截获后续跳转。
+        NcmConfig tlsCfg;
+        ConfigManager::Load(tlsCfg);
+        const bool allowRelax = https && HostAllowsTlsRelax(uc.lpszHostName, tlsCfg.apiUrl);
+        const int maxRelax = allowRelax ? 1 : 0;
         bool reqOk = false;
-        for(int relax = 0; relax < 2; ++relax){
+        for(int relax = 0; relax <= maxRelax; ++relax){
             g.req = WinHttpOpenRequest(g.con, L"GET", uc.lpszUrlPath, nullptr,
                                        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
                                        https ? WINHTTP_FLAG_SECURE : 0);
             if(!g.req) break;
             if(relax){
-                FsLog("HttpOpenGet: TLS cert check failed, retry once with relaxed flags");
+                FsLog("HttpOpenGet: mirror TLS cert check failed, retry once with relaxed flags");
                 DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
                                  SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
                 WinHttpSetOption(g.req, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
             }
             WinHttpAddRequestHeaders(g.req,
-                L"User-Agent: AIMP-NCM/1.3\r\nReferer: https://music.163.com\r\n",
+                L"User-Agent: AIMP-NCM/1.5\r\nReferer: https://music.163.com\r\n",
                 (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
 
             if(WinHttpSendRequest(g.req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
@@ -285,7 +289,7 @@ bool HttpOpenGet(const std::wstring& url, HttpGet& g, int* outStatus = nullptr){
                            err == ERROR_WINHTTP_SECURE_CERT_DATE_INVALID ||
                            err == ERROR_WINHTTP_SECURE_INVALID_CA ||
                            err == ERROR_WINHTTP_SECURE_INVALID_CERT);
-            if(!tlsErr || relax == 1) break;
+            if(!tlsErr || relax >= maxRelax) break;
         }
         if(!reqOk){ HttpClose(g); return false; }
 
@@ -529,9 +533,10 @@ struct ConnCloser {
 // 播放列表条目形如 http://127.0.0.1:{port}/x/{token}/{pid}/{tid}.mp3,
 // token 段用于防止本机其他进程(恶意网页/文档)直接借用代理拉流。
 // 校验失败统一返回 403, 不泄露任何内部信息。
+// 空 token 一律拒绝(不再放行): Start() 首次启动会自动生成; 老播放列表需重新「应用」同步。
 bool AuthTokenOk(const std::string& path){
     NcmConfig cfg; ConfigManager::Load(cfg);
-    if(cfg.localToken.empty()) return true;   // 未设置 token: 保持旧行为(兼容老配置)
+    if(cfg.localToken.empty()) return false;
     // 期望路径: /x/{token}/{pid}/{tid}
     const std::string kPrefix = "/x/";
     if(path.rfind(kPrefix, 0) != 0) return false;
@@ -539,12 +544,12 @@ bool AuthTokenOk(const std::string& path){
     size_t slash = rest.find('/');
     if(slash == std::string::npos) return false;
     std::string tok = rest.substr(0, slash);
-    return tok == WideToUtf8(cfg.localToken);
+    return SecureEquals(tok, WideToUtf8(cfg.localToken));
 }
-// 去掉路径中的 token 段, 得到 /{pid}/{tid} 形式; 未设置 token 时路径即原样
+// 去掉路径中的 token 段, 得到 /{pid}/{tid} 形式
 bool StripTokenPath(const std::string& path, std::string& out){
     NcmConfig cfg; ConfigManager::Load(cfg);
-    if(cfg.localToken.empty()){ out = path; return true; }
+    if(cfg.localToken.empty()) return false;
     const std::string kPrefix = "/x/";
     if(path.rfind(kPrefix, 0) != 0) return false;
     std::string rest = path.substr(kPrefix.size());
@@ -737,11 +742,19 @@ void RunCleanupNow(){
 bool Start(int preferredPort, int* boundPort){
     std::lock_guard<std::mutex> lk(g_srvMtx);   // B3: Start/Stop 互斥
     if(g_run){ if(boundPort) *boundPort = g_boundPort; return true; }
-    // 本地代理 token: 首次启动时自动生成并持久化(防止本机其他进程借用代理)
+    // 本地代理 token: 首次启动时自动生成并持久化(防止本机其他进程借用代理)。
+    // CSPRNG 失败时拒绝启动, 绝不在空 token 下监听。
     {
         NcmConfig cfg; ConfigManager::Load(cfg);
         if(cfg.localToken.empty()){
-            cfg.localToken = Utf8ToWide(NcmCrypto::RandomString(24));
+            for(int i = 0; i < 4 && cfg.localToken.empty(); ++i){
+                std::string rnd = NcmCrypto::RandomString(24);
+                if(rnd.size() >= 24) cfg.localToken = Utf8ToWide(rnd);
+            }
+            if(cfg.localToken.empty()){
+                FsLog("LocalServer start FAILED: cannot generate localToken (CSPRNG)");
+                return false;
+            }
             ConfigManager::Save(cfg);
         }
     }

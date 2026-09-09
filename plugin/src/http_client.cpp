@@ -1,4 +1,5 @@
 #include "http_client.h"
+#include "config.h"
 #include "utils.h"
 #include "error_notify.h"
 #include <sstream>
@@ -21,7 +22,7 @@ HttpResponse HttpClient::Request(const std::wstring& method, const std::wstring&
     HttpResponse resp;
     std::wstring host, path; INTERNET_PORT port; bool https;
     if (!CrackUrl(url, host, port, path, https)) return resp;
-    HINTERNET hSession = WinHttpOpen(L"AIMP-NCM/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nullptr, nullptr, 0);
+    HINTERNET hSession = WinHttpOpen(L"AIMP-NCM/1.5", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nullptr, nullptr, 0);
     if (!hSession) return resp;
     DWORD timeout=15000; WinHttpSetOption(hSession, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
     WinHttpSetOption(hSession, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
@@ -32,14 +33,18 @@ HttpResponse HttpClient::Request(const std::wstring& method, const std::wstring&
     if (!hConnect) { WinHttpCloseHandle(hSession); return resp; }
     DWORD flags = https ? WINHTTP_FLAG_SECURE : 0;
     HINTERNET hReq = nullptr;   // M2: 在放宽重试循环中按需创建
-    // M2: 默认严格 TLS 证书校验; 证书异常(自签 https 镜像等)记日志后仅放宽重试一次,
-    //     不再对全部请求无条件免检(直连 music.163.com 的请求携带登录态, 可被中间人截获)
+    // M2: 默认严格 TLS; 仅当目标 host 是用户配置的镜像时，证书异常才放宽重试一次。
+    //     直连 music.163.com / interface.music.163.com 的请求携带 MUSIC_U，禁止降级。
+    NcmConfig tlsCfg;
+    ConfigManager::Load(tlsCfg);
+    const bool allowRelax = https && HostAllowsTlsRelax(host, tlsCfg.apiUrl);
+    const int maxRelax = allowRelax ? 1 : 0;
     BOOL ok = FALSE;
-    for (int relax = 0; relax < 2; ++relax) {
+    for (int relax = 0; relax <= maxRelax; ++relax) {
         hReq = WinHttpOpenRequest(hConnect, method.c_str(), path.c_str(), nullptr, nullptr, nullptr, flags);
         if (!hReq) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return resp; }
         if (relax) {
-            FsLog("HttpClient: TLS cert check failed, retry once with relaxed flags");
+            FsLog("HttpClient: mirror TLS cert check failed, retry once with relaxed flags");
             DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA|SECURITY_FLAG_IGNORE_CERT_CN_INVALID|SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
             WinHttpSetOption(hReq, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
         }
@@ -79,8 +84,12 @@ HttpResponse HttpClient::Request(const std::wstring& method, const std::wstring&
                    err == ERROR_WINHTTP_SECURE_CERT_DATE_INVALID ||
                    err == ERROR_WINHTTP_SECURE_INVALID_CA ||
                    err == ERROR_WINHTTP_SECURE_INVALID_CERT);
-    if (!tlsErr || relax == 1) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return resp; }
+    // 仅镜像允许第二次(放宽)尝试; 非 TLS 错误或已用尽次数则直接失败。
+    // 必须在此 return —— 若 maxRelax==0 且 TLS 失败后掉出循环, hReq 已是 nullptr,
+    // 后续 WinHttpQueryHeaders 会空指针崩溃。
+    if (!tlsErr || relax >= maxRelax) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return resp; }
     }
+    if (!hReq) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return resp; }
     DWORD status=0, sz=sizeof(status);
     WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER, nullptr, &status, &sz, nullptr);
     resp.status=(int)status;

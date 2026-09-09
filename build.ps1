@@ -1,4 +1,4 @@
-﻿param(
+param(
   [string]$Config="Release"
 )
 $ErrorActionPreference="Stop"
@@ -34,6 +34,7 @@ Write-Host "CMake: $cmakeExe"
 $genArg = @()
 if($vsPath -match '2022'){ $genArg = @('-G','Visual Studio 17 2022') }
 elseif($vsPath -match '2019'){ $genArg = @('-G','Visual Studio 16 2019') }
+elseif($vsPath -match '\\18\\'){ $genArg = @('-G','Visual Studio 18 2026') }
 
 # Build x64
 $buildDir = Join-Path $PSScriptRoot "build"

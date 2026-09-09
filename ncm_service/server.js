@@ -15,6 +15,15 @@ try { api = require('NeteaseCloudMusicApi') } catch(e){ console.error('请先 np
 
 const TOKEN = process.env.NCM_MIRROR_TOKEN || ''
 
+// 恒定时间比较, 降低时序侧信道
+function tokenEquals(a, b){
+  if(typeof a !== 'string' || typeof b !== 'string') return false
+  if(a.length !== b.length) return false
+  let diff = 0
+  for(let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
+}
+
 const app = express()
 app.use(express.json())
 app.use(express.urlencoded({extended:true}))
@@ -39,7 +48,7 @@ const ALLOWED = new Set([
 app.all('*', (req, res, next)=>{
   if(TOKEN){
     const got = req.get('X-NCM-Token') || ''
-    if(got !== TOKEN) return res.status(403).json({code:403, msg:'forbidden: bad or missing X-NCM-Token'})
+    if(!tokenEquals(got, TOKEN)) return res.status(403).json({code:403, msg:'forbidden: bad or missing X-NCM-Token'})
   }
   if(!ALLOWED.has(req.path.replace(/^\//,''))){
     return res.status(404).json({code:404, msg:'module not found'})

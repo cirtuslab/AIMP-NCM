@@ -15,7 +15,7 @@ struct NcmConfig {
     int cacheDays = 7;     // 播放缓存保留天数; <=0 表示永不自动删除
     std::wstring cacheWhitelist; // 白名单歌单ID(逗号分隔), 其歌曲缓存永不删除
     std::wstring lyricMode = L"uslt"; // none=不注入歌词 / uslt=流内注入 USLT 歌词帧(已验证 mp3/flac/wav)
-    std::wstring deviceCookie;   // 设备指纹 Cookie(首次生成后持久化, 仅登录/换 Cookie 时刷新)
+    std::wstring deviceCookie;   // 设备指纹 Cookie(DPAPI 加密落盘; 仅登录/换 Cookie 时刷新)
     std::wstring localToken;     // 本地代理访问 token(随机生成, DPAPI 加密落盘; 播放列表 URL 携带)
 };
 

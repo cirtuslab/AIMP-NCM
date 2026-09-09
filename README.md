@@ -75,13 +75,14 @@ powershell -ExecutionPolicy Bypass -File release.ps1   # 生成 Release 压缩�
 | `cacheDays` | 播放缓存保留天数；`<=0` 永不删除（白名单例外） |
 | `cacheWhitelist` | 白名单歌单 ID（逗号分隔），其缓存永不清理 |
 | `lyricMode` | 歌词注入：`none` 不注入 / `uslt` 流内注入（默认） |
-| `deviceCookie` | 设备指纹 Cookie（首次生成后持久化，仅登录/换 Cookie 时刷新） |
+| `deviceCookieEnc` | 设备指纹 Cookie（DPAPI 加密；旧版明文 `deviceCookie` 自动迁移） |
 | `localTokenEnc` | 本地代理访问 Token（随机生成，DPAPI 加密保存；播放列表 URL 携带） |
 | `selectedPlaylists` | 勾选待同步的歌单 ID 数组 |
 
-> 凭据字段（`cookieEnc`/`mirrorTokenEnc`/`localTokenEnc`）使用 Windows DPAPI 加密，
+> 凭据字段（`cookieEnc`/`mirrorTokenEnc`/`localTokenEnc`/`deviceCookieEnc`）使用 Windows DPAPI 加密，
 > 仅当前 Windows 用户可解密；请勿把 `config.json` 复制到其他机器/用户。
 > 若旧版明文配置存在，首次保存时会自动加密迁移。
+> TLS 证书放宽（自签镜像）仅对配置的镜像 host 生效；直连网易云/CDN 一律严格校验。
 
 ## 本地缓存与日志
 
@@ -126,6 +127,7 @@ NCM_MIRROR_TOKEN=你的随机密钥 python app.py          # Python
   拉流失败不降级，重试 3 次仍失败会弹窗提示「此曲不可用」
 - **境外 460/403？** 启用代理并填国内 VPS 镜像
 - **「应用」按钮是灰的？** 先「刷新歌单」，勾选后按钮点亮
+- **v1.5.3 安全加固后旧播放列表 403？** 本地代理现强制 Token；请重新点一次「应用」同步歌单
 - **提示 401/403/429？** Cookie 可能已失效或触发风控：重新粘贴 `MUSIC_U`，
   或稍后重试 / 更换镜像
 - **中文用户名 Windows 账户能用吗？** 能。v1.5.1 起配置与元数据读写全部改用宽字符路径，
@@ -159,8 +161,8 @@ MIT。第三方：AIMP SDK © Artem Izmaylov，nlohmann/json MIT，NeteaseCloudM
 
 1. **本项目仅供个人学习与研究**，请勿用于任何商业用途。
 2. 通过非官方接口访问网易云音乐服务**可能违反《网易云音乐用户协议》**，由此导致的账号风控、限流、封禁等后果由使用者自行承担。
-3. 登录凭据（MUSIC_U Cookie 等）以**明文**保存在本地 `%APPDATA%\AIMP\NcmPlugin\config.json` 中，请妥善保管，切勿分享给他人或上传至公开场合；Cookie 泄露等同账号泄露。
-4. 插件会在本机回环地址（127.0.0.1）开启一个 HTTP 端口用于播放代理，仅本机可访问；请勿将其暴露到公网。
+3. 登录凭据（`MUSIC_U` Cookie、镜像 Token、本地代理 Token）在 `config.json` 中以 **Windows DPAPI（当前用户）** 加密保存（base64 字段 `cookieEnc` 等）。DPAPI 仅本机本用户可解密，请勿把配置目录复制到其他机器/用户；若需卸载或交接设备，请先在设置页清除 Cookie 或删除 `%APPDATA%\AIMP\NcmPlugin\`。Cookie 泄露等同账号泄露。
+4. 插件会在本机回环地址（127.0.0.1）开启一个 HTTP 端口用于播放代理，仅本机可访问；请勿将其暴露到公网。播放列表条目与 `%APPDATA%\AIMP\NcmPlugin\ncm_playlist.m3u8` 均携带本地代理 Token，**请勿导出/分享播放列表或该 m3u8 文件**。
 5. 网易云音乐接口随时可能变更导致本项目部分或全部功能失效，作者不承诺持续维护。
 6. 本项目与网易云音乐（网易公司）官方**无任何关联**，不代表官方立场；相关版权归原权利人所有。
 7. **下载、安装或使用本软件即表示您已阅读并理解上述风险，并自愿承担全部责任。** 如不同意，请立即停止使用并卸载。
