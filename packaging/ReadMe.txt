@@ -49,6 +49,11 @@ NOTICE
   NetEase Cloud Music, and using unofficial APIs may violate the service
   terms. Use at your own risk.
 
+License
+-------
+MIT. See the LICENSE and THIRD_PARTY_NOTICES.md files bundled in this package
+(AIMP SDK (c) Artem Izmaylov, nlohmann/json MIT, etc.).
+
 Project: https://github.com/cirtuslab/AIMP-NCM
 Issues:  https://github.com/cirtuslab/AIMP-NCM/issues
 

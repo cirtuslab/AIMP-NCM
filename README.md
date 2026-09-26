@@ -6,7 +6,7 @@
 
 ![Language](https://img.shields.io/badge/language-C%2B%2B-00599C)
 ![Version](https://img.shields.io/github/v/release/cirtuslab/AIMP-NCM?label=version&color=blue)
-![License](https://img.shields.io/badge/license-MIT-green)
+![License](https://img.shields.io/github/license/cirtuslab/AIMP-NCM)
 ![AIMP](https://img.shields.io/badge/AIMP-5%2B-orange)
 
 ## 功能特性
@@ -153,7 +153,12 @@ NCM_MIRROR_TOKEN=你的随机密钥 python app.py          # Python
 
 ## 许可
 
-MIT。第三方：AIMP SDK © Artem Izmaylov，nlohmann/json MIT，NeteaseCloudMusicApi MIT。
+本项目以 **MIT** 许可发布，全文见 [LICENSE](LICENSE)（`Copyright (c) 2026 cirtuslab / YuzuBD`）。
+
+收录、编译或依赖的第三方组件及其条款见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)：
+AIMP SDK © Artem Izmaylov（`plugin/third_party/aimp_sdk/` 头文件）、nlohmann/json MIT
+（编译进插件 DLL）、NeteaseCloudMusicApi / express 等（镜像服务的运行时 npm 依赖，不随仓库分发）。
+本仓库不含 AIMP 本体。
 
 ---
 

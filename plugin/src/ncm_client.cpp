@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "ncm_client.h"
 #include "http_client.h"
 #include "ncm_crypto.h"

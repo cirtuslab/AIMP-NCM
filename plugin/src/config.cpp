@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "config.h"
 #include "utils.h"
 #include <shlobj.h>

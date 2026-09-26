@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "aimp_ncm_plugin.h"
 #include "config.h"
 #include "filesystem.h"

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #pragma once
 #include "../third_party/aimp_sdk/apiPlugin.h"
 #include "../third_party/aimp_sdk/apiCore.h"

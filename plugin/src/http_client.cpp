@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "http_client.h"
 #include "config.h"
 #include "utils.h"

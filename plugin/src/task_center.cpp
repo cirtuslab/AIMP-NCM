@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "task_center.h"
 #include <atomic>
 #include <mutex>

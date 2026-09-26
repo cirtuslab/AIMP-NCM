@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "meta_cache.h"
 #include "config.h"
 #include "utils.h"

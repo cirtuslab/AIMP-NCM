@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "ncm_options_frame.h"
 #include "config.h"
 #include "utils.h"

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // NCM API 镜像服务 - 基于 nooblong/NeteaseCloudMusicApiBackup
 // 用法: npm install && node server.js
 // 默认端口 3000，插件 apiUrl 填 http://localhost:3000

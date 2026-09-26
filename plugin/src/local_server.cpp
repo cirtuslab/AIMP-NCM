@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // winsock2 must be included before windows.h (pulled in by config.h)
 #include <winsock2.h>
 #include <ws2tcpip.h>

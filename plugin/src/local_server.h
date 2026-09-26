@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #pragma once
 
 // 内嵌本地 HTTP 服务: 接收 http://127.0.0.1:{port}/{pid}/{tid} 请求,

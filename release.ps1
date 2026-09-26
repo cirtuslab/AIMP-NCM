@@ -22,6 +22,8 @@ Copy-Item -Force (Join-Path $PSScriptRoot "dist\x86\aimp_ncm.dll") (Join-Path $r
 Copy-Item -Recurse -Force (Join-Path $PSScriptRoot "ncm_service") (Join-Path $releaseDir "ncm_service")
 # Docs
 Copy-Item -Force (Join-Path $PSScriptRoot "README.md") $releaseDir
+Copy-Item -Force (Join-Path $PSScriptRoot "LICENSE") $releaseDir
+Copy-Item -Force (Join-Path $PSScriptRoot "THIRD_PARTY_NOTICES.md") $releaseDir
 
 $zip = Join-Path $PSScriptRoot "release\AIMP_NCM_v$Version.zip"
 Remove-Item -Force $zip -ErrorAction SilentlyContinue

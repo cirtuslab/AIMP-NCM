@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "ncm_crypto.h"
 #include <bcrypt.h>
 #include <windows.h>

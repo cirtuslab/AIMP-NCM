@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "error_notify.h"
 #include "aimp_task.h"
 #include "../third_party/aimp_sdk/apiGUI.h"

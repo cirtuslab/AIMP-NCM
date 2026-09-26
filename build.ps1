@@ -69,7 +69,8 @@ if(!(Test-Path "$stage\aimp_ncm.dll")){
 }
 Copy-Item -Force (Join-Path $PSScriptRoot "packaging\ReadMe.txt") $stage -ErrorAction SilentlyContinue
 # L5: manifest 已内嵌进 DLL 资源(RT_MANIFEST), 不再随包分发无效的外部 .dll.manifest
-Set-Content -LiteralPath (Join-Path $stage "LICENSE") -Value "MIT" -Encoding UTF8 -ErrorAction SilentlyContinue
+Copy-Item -Force (Join-Path $PSScriptRoot "LICENSE") $stage -ErrorAction SilentlyContinue
+Copy-Item -Force (Join-Path $PSScriptRoot "THIRD_PARTY_NOTICES.md") $stage -ErrorAction SilentlyContinue
 
 $zipTmp = Join-Path $buildDir "AIMP_NCM.zip"
 Remove-Item -Force $zipTmp -ErrorAction SilentlyContinue

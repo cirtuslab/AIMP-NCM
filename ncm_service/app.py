@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: MIT
 """
 AIMP NCM Python 侧载服务（零依赖，仅标准库 + requests）
 提供与 Node 镜像相同的极简 API，供插件或独立使用。

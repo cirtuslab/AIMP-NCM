@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "filesystem.h"
 #include "utils.h"
 #include "config.h"

@@ -1,4 +1,5 @@
-﻿#pragma once
+﻿// SPDX-License-Identifier: MIT
+#pragma once
 #include <string>
 #include <windows.h>
 struct WeapiResult { std::string params; std::string encSecKey; };
