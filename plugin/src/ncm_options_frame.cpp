@@ -271,6 +271,8 @@ IAIMPUICheckBox* NcmOptionsFrame::CreateChk(IAIMPUIWinControl* parent, const wch
 // ---------- 布局辅助（参考 aimp_desktop_lyrics 的行容器模式） ----------
 
 // 创建一行容器（ualTop 纵向堆叠），返回行 Panel
+// marginLeft: 行容器的左右留白。行控件直接挂到 GroupBox 时, 由这里统一提供
+//             "内容离边框的间距", 取代原先多套一层带边距的 Panel 的做法。
 IAIMPUIWinControl* NcmOptionsFrame::MakeRow(IAIMPUIWinControl* parent, const wchar_t* name,
     int height, int marginTop, int width){
     if(!uiSvc_ || !form_ || !parent) return nullptr;
@@ -280,9 +282,12 @@ IAIMPUIWinControl* NcmOptionsFrame::MakeRow(IAIMPUIWinControl* parent, const wch
     if(nm) nm->Release();
     if(FAILED(hr) || !row) return nullptr;
     row->SetValueAsInt32(AIMPUI_PANEL_PROPID_BORDERS, AIMPUI_FLAGS_BORDERS_NONE);
+    row->SetValueAsInt32(AIMPUI_PANEL_PROPID_TRANSPARENT, 1);
     TAIMPUIControlPlacement pl={};
     pl.Alignment = ualTop;
     pl.AlignmentMargins.top = marginTop;
+    pl.AlignmentMargins.left = 12;    // GroupBox 内容与边框的呼吸间距
+    pl.AlignmentMargins.right = 12;
     pl.Bounds.right = width; pl.Bounds.bottom = height;
     ((IAIMPUIControl*)row)->SetPlacement(pl);
     return row;
@@ -357,9 +362,12 @@ HWND NcmOptionsFrame::CreateFrame(HWND ParentWnd){
     //     原"隐藏消息窗口 + WM_USER+2/3/5 通知"通道已无发送方, 整体移除
 
     // 根容器：占满整个页面
+    // 纯布局容器不能画边框/底色, 否则会与内部 GroupBox 的边框叠加成"框内套框"
     IAIMPUIWinControl* root=nullptr;
     CreateCtl(form_, L"root", ualClient, 0,0, 0,0, IID_IAIMPUIPanel, (void**)&root);
     if(!root) return nullptr;
+    root->SetValueAsInt32(AIMPUI_PANEL_PROPID_BORDERS, AIMPUI_FLAGS_BORDERS_NONE);
+    root->SetValueAsInt32(AIMPUI_PANEL_PROPID_TRANSPARENT, 1);
     TAIMPUIControlPlacement plRoot={}; plRoot.Alignment=ualClient;
     ((IAIMPUIControl*)root)->SetPlacement(plRoot);
 
@@ -443,20 +451,17 @@ HWND NcmOptionsFrame::CreateFrame(HWND ParentWnd){
     }
 
     // ============ 播放设置与歌单 分组（占满剩余空间） ============
+    // 注意: 这里不再在 GroupBox 内再套一层 Panel。
+    // 原来的 grpList(GroupBox) -> listBody(Panel) 双层容器各自带边框,
+    // 视觉上就是"框内套框", 且两层边距叠加后内容被压得很紧。
+    // 现在行控件直接挂到 GroupBox 下, 只为各行保留统一的左右留白。
     IAIMPUIWinControl* grpList=nullptr;
     CreateCtl(root, L"grpList", ualClient, 0,0, 0,0, IID_IAIMPUIGroupBox, (void**)&grpList);
     if(grpList){
         grpList->SetValueAsObject(AIMPUI_GROUPBOX_PROPID_CAPTION, MakeStr(L"播放设置与歌单"));
-        IAIMPUIWinControl* body2=nullptr;
-        CreateCtl(grpList, L"listBody", ualClient, 0,0, 0,0, IID_IAIMPUIPanel, (void**)&body2);
-        if(body2){
-            TAIMPUIControlPlacement pl={}; pl.Alignment=ualClient;
-            pl.AlignmentMargins.left=12; pl.AlignmentMargins.top=18;
-            pl.AlignmentMargins.right=12; pl.AlignmentMargins.bottom=8;
-            ((IAIMPUIControl*)body2)->SetPlacement(pl);
-
+        {
             // ---- 行1: 音质 + 刷新按钮 + 提示 ----
-            IAIMPUIWinControl* rowQuality = MakeRow(body2, L"rowQuality", 24, 0, 420);
+            IAIMPUIWinControl* rowQuality = MakeRow(grpList, L"rowQuality", 24, 14, 420);
             if(rowQuality){
                 IAIMPUIWinControl* lblQuality = MakeLabel(rowQuality, L"lblQuality", L"音质:", 44, 20, 0, 2);
                 // 音质下拉
@@ -482,7 +487,7 @@ HWND NcmOptionsFrame::CreateFrame(HWND ParentWnd){
             }
 
             // ---- 行1.5: 缓存策略(保留时长 + 白名单歌单) ----
-            IAIMPUIWinControl* rowCache = MakeRow(body2, L"rowCache", 24, 8, 420);
+            IAIMPUIWinControl* rowCache = MakeRow(grpList, L"rowCache", 24, 8, 420);
             if(rowCache){
                 MakeLabel(rowCache, L"lblCache", L"缓存保留:", 62, 20, 0, 2);
                 {
@@ -517,7 +522,7 @@ HWND NcmOptionsFrame::CreateFrame(HWND ParentWnd){
             }
 
             // ---- 行1.6: 歌词注入模式 ----
-            IAIMPUIWinControl* rowLyric = MakeRow(body2, L"rowLyric", 24, 8, 420);
+            IAIMPUIWinControl* rowLyric = MakeRow(grpList, L"rowLyric", 24, 8, 420);
             if(rowLyric){
                 MakeLabel(rowLyric, L"lblLyric", L"歌词注入:", 62, 20, 0, 2);
                 {
@@ -540,7 +545,7 @@ HWND NcmOptionsFrame::CreateFrame(HWND ParentWnd){
             }
 
             // ---- 行1.7: 播放失败提示方式(下架/无版权/取流失败) ----
-            IAIMPUIWinControl* rowFail = MakeRow(body2, L"rowFail", 24, 8, 420);
+            IAIMPUIWinControl* rowFail = MakeRow(grpList, L"rowFail", 24, 8, 420);
             if(rowFail){
                 MakeLabel(rowFail, L"lblFail", L"失败提示:", 62, 20, 0, 2);
                 {
@@ -563,7 +568,7 @@ HWND NcmOptionsFrame::CreateFrame(HWND ParentWnd){
             }
 
             // ---- 行2: 歌单标题 + 计数 ----
-            IAIMPUIWinControl* rowTitle = MakeRow(body2, L"rowTitle", 20, 8, 420);
+            IAIMPUIWinControl* rowTitle = MakeRow(grpList, L"rowTitle", 20, 8, 420);
             if(rowTitle){
                 IAIMPUIWinControl* lblList = MakeLabel(rowTitle, L"lblList", L"歌单（勾选后点“应用”保存）", 200, 18, 0, 1);
                 lblCnt_ = MakeLabel(rowTitle, L"lblCnt", L"尚未选择", 140, 18, 20, 1);
@@ -576,7 +581,7 @@ HWND NcmOptionsFrame::CreateFrame(HWND ParentWnd){
                 TreeEvents* ev = new TreeEvents(this, OnTreeChanged);
                 IAIMPString* nm = MakeStr(L"lstPlaylists");
                 // TreeEvents 多继承两个事件接口, 到 IUnknown 需先显式走一个基类
-                hr = uiSvc_->CreateControl(form_, body2, nm,
+                hr = uiSvc_->CreateControl(form_, grpList, nm,
                                            (IUnknown*)(IAIMPUITreeListEvents*)ev,
                                            IID_IAIMPUITreeList, (void**)&lst_);
                 if(nm) nm->Release();
@@ -597,6 +602,9 @@ HWND NcmOptionsFrame::CreateFrame(HWND ParentWnd){
                     // ualClient 占满剩余空间，行容器之上
                     TAIMPUIControlPlacement pl={}; pl.Alignment=ualClient;
                     pl.AlignmentMargins.top=4;
+                    pl.AlignmentMargins.left=12;      // 与上方各行对齐
+                    pl.AlignmentMargins.right=12;
+                    pl.AlignmentMargins.bottom=10;    // 距 GroupBox 下边框
                     ((IAIMPUIControl*)lst_)->SetPlacement(pl);
                 }
             }
