@@ -32,9 +32,11 @@ public:
     bool GetPlaylistDetail(long long pid, std::vector<NcmSong>& outSongs, NcmPlaylist* info=nullptr);
     bool GetSongUrl(long long id, std::string& outUrl, std::string& outType);
     // 指定音质取链(供回退阶梯使用): level 如 standard/exhigh/lossless; reason 返回失败原因
-    bool GetSongUrlLevel(long long id, const std::string& level, std::string& outUrl, std::string& outType, std::string* reason=nullptr);
+    // fatal=true 表示请求层失败(空响应/非 JSON), 换音质无意义, 调用方应停止降档阶梯
+    bool GetSongUrlLevel(long long id, const std::string& level, std::string& outUrl, std::string& outType, std::string* reason=nullptr, bool* fatal=nullptr);
     bool GetSongDetail(long long id, NcmSong& out);
-    bool GetLyric(long long id, std::string& outLrc);
+    // 取歌词; noLyric 输出 true 表示服务端明确答复"无歌词"(区别于网络失败)
+    bool GetLyric(long long id, std::string& outLrc, bool* noLyric=nullptr);
     bool IsLoggedIn();
     static long long ParseUidFromCookie(const std::wstring& cookie);
     // 设备指纹: 持久化于 config.deviceCookie, 仅登录/换 Cookie 时重新生成

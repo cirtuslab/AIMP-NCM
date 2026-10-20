@@ -139,6 +139,36 @@ inline std::wstring NormalizeCoverUrl(const std::wstring& url){
     return url;
 }
 
+// ---- 歌词/封面下载的失败负缓存 ----
+// 下载失败后此前不留任何痕迹，而 BuildStreamTag 在查缓存之前就会调用，导致每次连接
+// （包括拖动进度条触发的重连）都重新联网：实测 1468 次 lyric CACHE-MISS 仅对应 1100 首歌，
+// 单曲最多重复 7 次，每次最长阻塞 15s。这里用标记文件在 TTL 内跳过网络：
+//  - 服务端明确答复"没有该资源"（纯音乐/无封面）：长期标记，基本不再请求；
+//  - 网络/接口层失败（超时/空响应/风控）：短期标记，恢复后能自动重试。
+const ULONGLONG kMissTtlPermanentMs = 7ull * 24 * 3600 * 1000;   // 7 天
+const ULONGLONG kMissTtlTransientMs = 5ull * 60 * 1000;          // 5 分钟
+
+ULONGLONG NowMs(){
+    FILETIME ft; GetSystemTimeAsFileTime(&ft);
+    return (((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime) / 10000;
+}
+
+bool MarkerFresh(const std::wstring& path, ULONGLONG ttlMs){
+    WIN32_FILE_ATTRIBUTE_DATA d{};
+    if(!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &d)) return false;
+    ULONGLONG written = (((ULONGLONG)d.ftLastWriteTime.dwHighDateTime << 32) |
+                         d.ftLastWriteTime.dwLowDateTime) / 10000;
+    ULONGLONG now = NowMs();
+    if(now <= written) return true;
+    return (now - written) < ttlMs;
+}
+
+void TouchMarker(const std::wstring& path){
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if(h != INVALID_HANDLE_VALUE) CloseHandle(h);
+}
+
 // ---- 元数据缓存: song_meta.json ----
 // 结构: { "<pid>": { "<tid>": {title, artist, album, durationMs, coverUrl} } }
 // 与 config.json 同放配置目录(%APPDATA%\AIMP\NcmPlugin\): 元数据是持久数据,
@@ -372,9 +402,15 @@ bool GetCoverBytes(long long tid, const std::wstring& coverUrl, std::string& out
     std::wstring p = ArtCacheDir() + L"\\" + std::to_wstring(tid) + L".img";
     if(ReadFileAll(p, out)) return true;
     if(coverUrl.empty()) return false;
+    // 负缓存: 封面缺失/下载失败都不影响播放, 但重复下载会明显拖慢首播(实测单张最大 9.8MB)
+    std::wstring miss = ArtCacheDir() + L"\\" + std::to_wstring(tid) + L".miss";
+    if(MarkerFresh(miss, kMissTtlPermanentMs)) return false;
     std::wstring url = NormalizeCoverUrl(coverUrl);
     // 封面以源头原始尺寸下载, 不再强制追加 ?param=500y500 缩略参数
-    if(!HttpDownloadBytes(url, out)) return false;
+    if(!HttpDownloadBytes(url, out)){
+        TouchMarker(miss);
+        return false;
+    }
     if(!out.empty()) WriteFileAll(p, out);
     return !out.empty();
 }
@@ -389,6 +425,24 @@ bool GetLyricText(long long tid, std::string& out){
         FsLog(b);
         return true;
     }
+    // 负缓存分两档(两个独立标记文件, 避免长 TTL 吞掉短 TTL):
+    //  - .nolyric: 服务端明确回答"没有歌词"(纯音乐/无版权), 7 天内不再请求;
+    //  - .miss:    网络/风控/解析失败, 5 分钟后自动重试。
+    const std::wstring noLyricMarker = LyricCacheDir() + L"\\" + std::to_wstring(tid) + L".nolyric";
+    const std::wstring transientMarker = LyricCacheDir() + L"\\" + std::to_wstring(tid) + L".miss";
+    {
+        char b[192];
+        if(MarkerFresh(noLyricMarker, kMissTtlPermanentMs)){
+            sprintf_s(b, "lyric tid=%lld NEGATIVE-CACHE (no lyric, skip network)", (long long)tid);
+            FsLog(b);
+            return false;
+        }
+        if(MarkerFresh(transientMarker, kMissTtlTransientMs)){
+            sprintf_s(b, "lyric tid=%lld NEGATIVE-CACHE (transient failure, skip network)", (long long)tid);
+            FsLog(b);
+            return false;
+        }
+    }
     // 未命中: 网络拉取(直连 weapi /api/song/lyric 或镜像 /lyric), 成功后落盘
     // 注意: 本函数在锁外调用, 可安全进行网络请求
     NcmConfig cfg; ConfigManager::Load(cfg);
@@ -399,10 +453,19 @@ bool GetLyricText(long long tid, std::string& out){
                   (cfg.useProxy && !cfg.apiUrl.empty()) ? "mirror" : "direct");
         FsLog(b);
     }
-    if(!client.GetLyric(tid, out) || out.empty()){
-        char b[160];
-        sprintf_s(b, "lyric tid=%lld DOWNLOAD-FAIL empty=%d", (long long)tid, (int)out.empty());
-        FsLog(b);
+    bool noLyric = false;
+    if(!client.GetLyric(tid, out, &noLyric) || out.empty()){
+        if(noLyric){
+            TouchMarker(noLyricMarker);
+            char b[160];
+            sprintf_s(b, "lyric tid=%lld NO-LYRIC (server), marked 7d", (long long)tid);
+            FsLog(b);
+        } else {
+            TouchMarker(transientMarker);
+            char b[160];
+            sprintf_s(b, "lyric tid=%lld DOWNLOAD-FAIL (transient), marked 5min", (long long)tid);
+            FsLog(b);
+        }
         return false;
     }
     {
@@ -412,6 +475,9 @@ bool GetLyricText(long long tid, std::string& out){
         FsLog(b);
     }
     WriteFileAll(p, out);
+    // 成功即清除可能残留的负缓存标记
+    DeleteFileW(noLyricMarker.c_str());
+    DeleteFileW(transientMarker.c_str());
     return true;
 }
 

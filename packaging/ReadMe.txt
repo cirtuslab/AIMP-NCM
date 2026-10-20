@@ -1,7 +1,7 @@
 AIMP NCM (网易云串流)
 =====================
 
-[v1.5.3] Stream NetEase Cloud Music playlists into AIMP 5.x.
+[v1.5.4] Stream NetEase Cloud Music playlists into AIMP 5.x.
 安全：凭据 DPAPI 加密、本地代理强制 Token、TLS 仅对配置镜像放宽。
 
 Playlist entries are served through the plugin's built-in local proxy
@@ -16,6 +16,7 @@ Features:
 - One-click playlist sync to the "网易云串流" playlist
 - In-stream metadata + cover + lyrics (USLT, toggleable)
 - Direct (weapi/eapi) or optional mirror mode
+- Failure notifications: dialog (no beep) or silent auto-skip
 
 Install
 -------
@@ -32,11 +33,19 @@ Configuration
 
 Open AIMP Options -> Plugins -> "网易云串流" for the settings page.
 Lyrics can be disabled there (歌词注入 -> 不注入) if needed.
+Unavailable-track popups can be switched to silent skip there
+(失败提示 -> 自动跳过（不提醒）).
 
-Upgrade note (v1.5.3)
+Upgrade note (v1.5.4)
 ---------------------
-Local proxy now requires a path token. After upgrading, open the plugin
-settings and click 应用 once to re-sync the playlist (old entries return 403).
+- Unplayable/de-listed tracks no longer play a system beep.
+- New setting 失败提示 lets you silence per-track failure popups entirely
+  (the track is then skipped and a line is written to the diagnostic log).
+- Lyrics: original text is now requested with lv=-1 (falls back to lv=1),
+  fixing tracks whose original lyrics were only available in older
+  revisions; metadata lines (作词/作曲/制作人) no longer receive a
+  mistimed translation.
+- No breaking changes; existing config.json and playlists keep working.
 
 NOTICE
 ------

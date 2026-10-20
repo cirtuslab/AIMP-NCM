@@ -172,6 +172,9 @@ NcmConfig ParseConfig(const json& j){
     cfg.cacheDays = j.value("cacheDays", 7);
     cfg.cacheWhitelist = Utf8ToWide(j.value("cacheWhitelist",""));
     cfg.lyricMode = Utf8ToWide(j.value("lyricMode","uslt"));
+    cfg.failNotify = Utf8ToWide(j.value("failNotify","dialog"));
+    if(cfg.failNotify != L"dialog" && cfg.failNotify != L"silent" && cfg.failNotify != L"off")
+        cfg.failNotify = L"dialog";   // 非法/旧配置回落到默认弹窗
     cfg.deviceCookie = LoadSecret(j, "deviceCookieEnc", "deviceCookie");
     cfg.localToken = LoadSecret(j, "localTokenEnc", "localToken");
     cfg.selectedPlaylists.clear();
@@ -192,6 +195,7 @@ json DumpConfig(const NcmConfig& cfg){
     j["cacheDays"] = cfg.cacheDays;
     j["cacheWhitelist"] = WideToUtf8(cfg.cacheWhitelist);
     j["lyricMode"] = WideToUtf8(cfg.lyricMode);
+    j["failNotify"] = WideToUtf8(cfg.failNotify);
     SaveSecret(j, "deviceCookieEnc", "deviceCookie", cfg.deviceCookie);
     SaveSecret(j, "localTokenEnc", "localToken", cfg.localToken);
     j["selectedPlaylists"] = cfg.selectedPlaylists;

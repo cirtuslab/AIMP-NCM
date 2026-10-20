@@ -23,6 +23,8 @@
 - **本地代理播放**：内嵌 `http://127.0.0.1:{port}` 服务（默认 47777，占用自动后移），
   实时解析真实 CDN 链接并代理拉流，支持磁盘缓存与 Range/seek——链接不过期、无需预取；
   下载失败自动重试（同一链接最多 3 次），仍失败弹窗提示「此曲不可用」
+- **失败提示可关**：下架/无版权曲目默认弹窗提醒（**无系统提示音**），
+  也可设为「自动跳过」——只写诊断日志，不再打断播放
 - **音质八档**：`standard / higher / exhigh / lossless / hires / jymaster / jyeffect / sky`，
   配置音质不存在时自动降到可用最高档（高音质需会员）；切换后**下次播放起生效**
 - **磁盘缓存策略**：保留天数可选（1/3/7/30 天或永不删除），支持白名单歌单缓存永不清理
@@ -75,6 +77,7 @@ powershell -ExecutionPolicy Bypass -File release.ps1   # 生成 Release 压缩�
 | `cacheDays` | 播放缓存保留天数；`<=0` 永不删除（白名单例外） |
 | `cacheWhitelist` | 白名单歌单 ID（逗号分隔），其缓存永不清理 |
 | `lyricMode` | 歌词注入：`none` 不注入 / `uslt` 流内注入（默认） |
+| `failNotify` | 播放失败提示：`dialog` 弹窗（默认，无提示音）/ `silent` 自动跳过只记日志 |
 | `deviceCookieEnc` | 设备指纹 Cookie（DPAPI 加密；旧版明文 `deviceCookie` 自动迁移） |
 | `localTokenEnc` | 本地代理访问 Token（随机生成，DPAPI 加密保存；播放列表 URL 携带） |
 | `selectedPlaylists` | 勾选待同步的歌单 ID 数组 |

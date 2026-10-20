@@ -60,6 +60,7 @@ private:
     static void OnTreeChanged(NcmOptionsFrame* self);
     static void OnCacheChanged(NcmOptionsFrame* self){ self->SaveConfig(true); }
     static void OnLyricChanged(NcmOptionsFrame* self){ self->SaveConfig(true); }
+    static void OnFailNotifyChanged(NcmOptionsFrame* self){ self->SaveConfig(true); }
 
     // 遍历歌单树, 把勾选节点的 TAG 收集进 cfg.selectedPlaylists
     void CollectSelection(NcmConfig& cfg);
@@ -103,6 +104,7 @@ private:
     IAIMPUIWinControl* cboCache_ = nullptr;   // 缓存保留时长下拉
     IAIMPUIWinControl* eCacheWL_ = nullptr;   // 白名单歌单ID输入框
     IAIMPUIWinControl* cboLyric_ = nullptr;   // 歌词注入模式下拉
+    IAIMPUIWinControl* cboFail_ = nullptr;    // 播放失败提示方式下拉
 
     bool loading_ = false;
 };

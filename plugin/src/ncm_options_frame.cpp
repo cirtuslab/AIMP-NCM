@@ -539,6 +539,29 @@ HWND NcmOptionsFrame::CreateFrame(HWND ParentWnd){
                 MakeLabel(rowLyric, L"hintLyric", L"USLT 已验证支持 mp3/flac/wav；首次播放拉取后缓存", 300, 18, 12, 3);
             }
 
+            // ---- 行1.7: 播放失败提示方式(下架/无版权/取流失败) ----
+            IAIMPUIWinControl* rowFail = MakeRow(body2, L"rowFail", 24, 8, 420);
+            if(rowFail){
+                MakeLabel(rowFail, L"lblFail", L"失败提示:", 62, 20, 0, 2);
+                {
+                    CtlEvents* ev = new CtlEvents(this, OnFailNotifyChanged);
+                    IAIMPString* nm = MakeStr(L"cboFail");
+                    hr = uiSvc_->CreateControl(form_, rowFail, nm, (IUnknown*)ev, IID_IAIMPUIComboBox, (void**)&cboFail_);
+                    if(nm) nm->Release();
+                    ev->Release();
+                    if(SUCCEEDED(hr) && cboFail_){
+                        IAIMPUIBaseComboBox* cb=(IAIMPUIBaseComboBox*)cboFail_;
+                        const wchar_t* items[]={L"弹窗提醒（无提示音）",L"自动跳过（不提醒）"};
+                        for(int i=0;i<2;i++){
+                            IAIMPString* s=MakeStr(items[i]);
+                            if(s){ cb->Add(s, 0); s->Release(); }
+                        }
+                        PlaceLeft(cboFail_, 170, 22, 8, 1);
+                    }
+                }
+                MakeLabel(rowFail, L"hintFail", L"下架/无版权曲目：选择静默后将直接跳过，不再打断播放", 300, 18, 12, 3);
+            }
+
             // ---- 行2: 歌单标题 + 计数 ----
             IAIMPUIWinControl* rowTitle = MakeRow(body2, L"rowTitle", 20, 8, 420);
             if(rowTitle){
@@ -598,6 +621,7 @@ void NcmOptionsFrame::DestroyFrame(){
     if(cboCache_){ cboCache_->Release(); cboCache_=nullptr; }
     if(eCacheWL_){ eCacheWL_->Release(); eCacheWL_=nullptr; }
     if(cboLyric_){ cboLyric_->Release(); cboLyric_=nullptr; }
+    if(cboFail_){ cboFail_->Release(); cboFail_=nullptr; }
     if(form_){ ((IUnknown*)form_)->Release(); form_=nullptr; }
 }
 
@@ -816,6 +840,11 @@ void NcmOptionsFrame::LoadConfig(){
             IAIMPUIBaseComboBox* cb=(IAIMPUIBaseComboBox*)cboLyric_;
             cb->SetValueAsInt32(AIMPUI_COMBOBOX_PROPID_ITEMINDEX, cfg.lyricMode == L"none" ? 0 : 1);
         }
+        if(cboFail_){
+            IAIMPUIBaseComboBox* cb=(IAIMPUIBaseComboBox*)cboFail_;
+            // dialog -> 0(弹窗), silent/off -> 1(自动跳过)
+            cb->SetValueAsInt32(AIMPUI_COMBOBOX_PROPID_ITEMINDEX, cfg.failNotify == L"dialog" ? 0 : 1);
+        }
     }
     if(st_){
         std::wstring s = L"就绪";
@@ -903,6 +932,11 @@ void NcmOptionsFrame::SaveConfig(bool notify){
         int idx = 1;
         cboLyric_->GetValueAsInt32(AIMPUI_COMBOBOX_PROPID_ITEMINDEX, &idx);
         cfg.lyricMode = (idx == 0) ? L"none" : L"uslt";
+    }
+    if(cboFail_){
+        int idx = 0;
+        cboFail_->GetValueAsInt32(AIMPUI_COMBOBOX_PROPID_ITEMINDEX, &idx);
+        cfg.failNotify = (idx == 0) ? L"dialog" : L"silent";
     }
     // 收集歌单树当前勾选状态(此前勾选从未被保存, "应用"也不会点亮)
     CollectSelection(cfg);

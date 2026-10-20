@@ -16,6 +16,29 @@ void FsLog(const char* what);   // 定义于 filesystem.cpp; 歌词下载诊断�
 
 namespace {
 
+// ---- 类型安全取值 ----
+// 网易云对无封面/无版权/已下架的条目会显式返回 null 字段, 例如:
+//   {"al":{"name":"x","picUrl":null}} / {"url":null,"type":null,"code":404}
+// 而 nlohmann 的 value()/get<T>() 遇到 null 会抛 type_error.302, 不会用默认值兜底,
+// 调用方的 catch(...) 会把整首歌(乃至整页歌单剩余部分)丢掉。
+// 下面三个函数对 "字段缺失 / null / 类型不符" 一律返回默认值, 绝不抛异常。
+std::string JStr(const json& o, const char* key){
+    if(!o.is_object()) return "";
+    auto it = o.find(key);
+    if(it == o.end() || !it->is_string()) return "";
+    return it->get<std::string>();
+}
+long long JInt64(const json& o, const char* key, long long def){
+    if(!o.is_object()) return def;
+    auto it = o.find(key);
+    if(it == o.end()) return def;
+    if(it->is_number_unsigned()) return (long long)it->get<unsigned long long>();
+    if(it->is_number_integer()) return it->get<long long>();
+    if(it->is_number_float()) return (long long)it->get<double>();
+    return def;
+}
+int JInt(const json& o, const char* key, int def){ return (int)JInt64(o, key, def); }
+
 // 解析 LRC 时间戳(支持 mm:ss.xx / mm:ss.xxx), 返回毫秒; 失败返回 false
 bool ParseLrcMs(const std::string& ts, int& outMs){
     int mm=0, ss=0, frac=0;
@@ -58,6 +81,35 @@ std::string TrimLrcText(const std::string& text){
     return text.substr(b, e-b+1);
 }
 
+// 元数据行判定: "作词 : xxx" / "作曲 : xxx" / "制作人 : xxx" 这类信息行。
+// 它们带时间戳且文本非空, 但本身不是歌词, 不应挂翻译。
+// 起因: 1861126812 的 yrc 行首三行元数据时间戳均为 0ms, 而翻译第一条也是 0ms,
+//       按时间戳就近匹配时被错误配上中文翻译, 表现为"开头几句出现中文翻译"。
+bool IsLyricMetadataLine(const std::string& text){
+    static const char* kKeys[] = {
+        "作词", "作曲", "编曲", "制作人", "监制", "混音", "母带", "录音",
+        "吉他", "贝斯", "鼓", "键盘", "和声", "弦乐", "词", "曲", "演唱", "原唱"
+    };
+    // yrc 转出来的行形如 "<00:00.000> 作词 : xxx", 判定前先剥掉行首的逐字标记
+    size_t start = 0;
+    while(start < text.size() && text[start] == '<'){
+        size_t gt = text.find('>', start);
+        if(gt == std::string::npos) break;
+        start = gt + 1;
+        while(start < text.size() && text[start] == ' ') ++start;
+    }
+    std::string body = TrimLrcText(text.substr(start));
+    // 形如 "作词 : xxx" / "作词: xxx" / "作词 :xxx"
+    size_t colon = body.find_first_of(":：");
+    if(colon == std::string::npos) return false;
+    std::string head = TrimLrcText(body.substr(0, colon));
+    if(head.empty() || head.size() > 12) return false;   // 键名过长则不是元数据
+    for(const char* k : kKeys){
+        if(head == k) return true;
+    }
+    return false;
+}
+
 // 合并原词与翻译: 翻译行按时间戳就近匹配(±350ms 容差, 参考 AIMPLyricsSaver),
 // 输出 "原词行\n[ts]翻译行"; 无翻译时原样返回原词; 逐字歌词(klyric/yrc)不参与
 std::string MergeLyricWithTranslation(const std::string& orig, const std::string& trans){
@@ -91,9 +143,10 @@ std::string MergeLyricWithTranslation(const std::string& orig, const std::string
         std::vector<LrcStamp> stamps;
         size_t textPos = 0;
         bool hasStamp = ExtractLrcStamps(line, stamps, textPos);
-        bool emptyText = hasStamp && TrimLrcText(line.substr(textPos)).empty();
+        std::string body = hasStamp ? TrimLrcText(line.substr(textPos)) : std::string();
         out += line; out += "\n";
-        if(!hasStamp || emptyText) continue;      // 元数据行/空行不挂翻译
+        // 元数据行(作词/作曲/...)与空行不挂翻译
+        if(!hasStamp || body.empty() || IsLyricMetadataLine(body)) continue;
         const TransLine* best = nullptr;
         int bestDiff = 351;
         for(auto& c : translated){
@@ -196,20 +249,21 @@ std::string ConvertYrcToLrc(const std::string& yrc){
 // 从歌单/详情接口的歌曲 JSON 解析 NcmSong
 bool ParseSongJson(const json& s, NcmSong& out){
     out = NcmSong();
-    out.id = s.value("id", 0LL);
-    out.title = Utf8ToWide(s.value("name",""));
-    out.durationMs = s.value("dt", 0);
+    if(!s.is_object()) return false;
+    out.id = JInt64(s, "id", 0);
+    out.title = Utf8ToWide(JStr(s, "name"));
+    out.durationMs = JInt(s, "dt", 0);
     if(s.contains("ar") && s["ar"].is_array() && !s["ar"].empty()){
         std::wstring arts;
         for(size_t i=0;i<s["ar"].size();++i){
             if(i) arts += L"/";
-            arts += Utf8ToWide(s["ar"][i].value("name",""));
+            arts += Utf8ToWide(JStr(s["ar"][i], "name"));
         }
         out.artist = arts;
     }
     if(s.contains("al") && s["al"].is_object()){
-        out.album = Utf8ToWide(s["al"].value("name",""));
-        if(s["al"].contains("picUrl")) out.coverUrl = Utf8ToWide(s["al"].value("picUrl",""));
+        out.album = Utf8ToWide(JStr(s["al"], "name"));
+        out.coverUrl = Utf8ToWide(JStr(s["al"], "picUrl"));   // 无封面时为 null, 取空串即可
     }
     return out.id > 0;
 }
@@ -419,12 +473,13 @@ bool NcmClient::GetUserPlaylists(long long uid, std::vector<NcmPlaylist>& out, i
         else if(js.contains("body") && js["body"].contains("playlist")) arr = js["body"]["playlist"];
         out.clear();
         for(auto& p: arr){
+            if(!p.is_object()) continue;
             NcmPlaylist pl;
-            pl.id = p.value("id", 0LL);
-            pl.name = Utf8ToWide(p.value("name",""));
-            pl.trackCount = p.value("trackCount", 0);
-            if(p.contains("creator") && p["creator"].is_object()) pl.creator = Utf8ToWide(p["creator"].value("nickname",""));
-            if(p.contains("coverImgUrl")) pl.coverUrl = Utf8ToWide(p["coverImgUrl"].get<std::string>());
+            pl.id = JInt64(p, "id", 0);
+            pl.name = Utf8ToWide(JStr(p, "name"));
+            pl.trackCount = JInt(p, "trackCount", 0);
+            if(p.contains("creator") && p["creator"].is_object()) pl.creator = Utf8ToWide(JStr(p["creator"], "nickname"));
+            pl.coverUrl = Utf8ToWide(JStr(p, "coverImgUrl"));
             out.push_back(pl);
         }
         return true;
@@ -452,7 +507,7 @@ bool NcmClient::GetPlaylistDetail(long long pid, std::vector<NcmSong>& outSongs,
                 for(auto& s : songs){ NcmSong song; if(ParseSongJson(s, song)) outSongs.push_back(song); }
                 if(info && info->name.empty() && js.contains("playlist") && js["playlist"].is_object()){
                     info->id = pid;
-                    if(js["playlist"].contains("name")) info->name = Utf8ToWide(js["playlist"].value("name",""));
+                    info->name = Utf8ToWide(JStr(js["playlist"], "name"));
                 }
                 if(songs.size() < 1000) break;   // 不足一页即拉完
                 offset += 1000;
@@ -477,7 +532,7 @@ bool NcmClient::GetPlaylistDetail(long long pid, std::vector<NcmSong>& outSongs,
 
         std::vector<long long> trackIds;
         if(js.contains("playlist") && js["playlist"].contains("trackIds") && js["playlist"]["trackIds"].is_array()){
-            for(auto& t : js["playlist"]["trackIds"]) trackIds.push_back(t.value("id", 0LL));
+            for(auto& t : js["playlist"]["trackIds"]) trackIds.push_back(JInt64(t, "id", 0));
         }
 
         for(auto& s : tracks){ NcmSong song; if(ParseSongJson(s, song)) outSongs.push_back(song); }
@@ -497,7 +552,7 @@ bool NcmClient::GetPlaylistDetail(long long pid, std::vector<NcmSong>& outSongs,
                     else if(djs.contains("body") && djs["body"].contains("songs")) arr = djs["body"]["songs"];
                     if(arr.is_array()){
                         std::map<long long, json> byId;
-                        for(auto& s : arr) byId[s.value("id", 0LL)] = s;
+                        for(auto& s : arr) byId[JInt64(s, "id", 0)] = s;
                         for(size_t i = off; i < end; i++){
                             auto it = byId.find(trackIds[i]);
                             if(it != byId.end()){
@@ -511,7 +566,7 @@ bool NcmClient::GetPlaylistDetail(long long pid, std::vector<NcmSong>& outSongs,
         }
         if(info && js.contains("playlist") && js["playlist"].is_object()){
             info->id = pid;
-            if(js["playlist"].contains("name")) info->name = Utf8ToWide(js["playlist"].value("name",""));
+            info->name = Utf8ToWide(JStr(js["playlist"], "name"));
             info->trackCount = (int)outSongs.size();
         }
         return !outSongs.empty();
@@ -522,8 +577,14 @@ bool NcmClient::GetSongUrl(long long id, std::string& outUrl, std::string& outTy
     if(level.empty()) level="exhigh";
     return GetSongUrlLevel(id, level, outUrl, outType);
 }
-bool NcmClient::GetSongUrlLevel(long long id, const std::string& levelUtf8, std::string& outUrl, std::string& outType, std::string* reason){
+bool NcmClient::GetSongUrlLevel(long long id, const std::string& levelUtf8, std::string& outUrl, std::string& outType, std::string* reason, bool* fatal){
     auto fail=[&](const char* r){ if(reason) *reason=r; return false; };
+    // 区分两类失败, 供音质回退阶梯决策:
+    //  - 非致命(本档无链): 响应正常但该音质无 url(code=404 等), 降档有意义, 调用方继续尝试;
+    //  - 致命(请求层失败): 空响应/网络不可达/非 JSON, 换音质只会重复同一个失败请求,
+    //    调用方应立即停止阶梯(否则一首歌会被放大成 5 次请求, 实测占比 2550/2685)。
+    if(fatal) *fatal = false;
+    auto failFatal=[&](const char* r){ if(reason) *reason=r; if(fatal) *fatal = true; return false; };
     const std::string level = levelUtf8.empty() ? "exhigh" : levelUtf8;
     // eapi 参数参考 go-musicfox: ids 数组 + level + encodeType + header
     std::string ids = "[" + std::to_string(id) + "]";
@@ -577,14 +638,17 @@ bool NcmClient::GetSongUrlLevel(long long id, const std::string& levelUtf8, std:
         if(js.contains("data") && js["data"].is_array() && !js["data"].empty()) data=js["data"][0];
         else if(js.contains("body") && js["body"].contains("data") && !js["body"]["data"].empty()) data=js["body"]["data"][0];
         else return fail("no-data");
-        outUrl = data.value("url","");
-        outType = data.value("type","mp3");
-        int code = data.value("code",0);
+        // 字段必须按类型安全取值: 无版权曲目会返回 {"url":null,"type":null,"code":404}
+        outUrl = JStr(data, "url");
+        outType = JStr(data, "type");
+        if(outType.empty()) outType = "mp3";
+        int code = JInt(data, "code", 0);
         if(outUrl.empty()) return fail(("url-empty code="+std::to_string(code)).c_str());
         if(code!=200) return fail(("code="+std::to_string(code)).c_str());
         return true;
     } catch(...){
-        // 诊断: 带 HTTP 状态与响应体前缀, 便于区分风控 HTML / 空响应 / 加密格式变化
+        // 到这里只可能是响应本身不是合法 JSON(空响应 / 风控页面 / 加密格式变化),
+        // 属于请求层失败, 换音质重试没有意义 → 标记为致命, 让调用方停止阶梯。
         std::string clean;
         clean.reserve(resp.size());
         for(char ch : resp){
@@ -593,8 +657,14 @@ bool NcmClient::GetSongUrlLevel(long long id, const std::string& levelUtf8, std:
             else clean += ch;
         }
         if(clean.size() > 96) clean.resize(96);
-        return fail(("json-parse-error http=" + std::to_string(httpStatus) +
-                     " size=" + std::to_string(resp.size()) + " head=" + clean).c_str());
+        if(resp.empty()){
+            char b[96];
+            sprintf_s(b, "empty-response http=%d (网络不可达/超时)", httpStatus);
+            return failFatal(b);
+        }
+        std::string msg = "non-json-response http=" + std::to_string(httpStatus) +
+                          " size=" + std::to_string(resp.size()) + " head=" + clean;
+        return failFatal(msg.c_str());
     }
 }
 bool NcmClient::GetSongDetail(long long id, NcmSong& out){
@@ -611,37 +681,67 @@ bool NcmClient::GetSongDetail(long long id, NcmSong& out){
         if(arr.empty()) return false;
         auto s=arr[0];
         out.id=id;
-        out.title=Utf8ToWide(s.value("name",""));
-        out.durationMs=s.value("dt",0);
-        if(s.contains("ar") && !s["ar"].empty()){
+        out.title=Utf8ToWide(JStr(s, "name"));
+        out.durationMs=JInt(s, "dt", 0);
+        if(s.contains("ar") && s["ar"].is_array() && !s["ar"].empty()){
             std::wstring arts;
-            for(size_t i=0;i<s["ar"].size();++i){ if(i) arts+=L"/"; arts+=Utf8ToWide(s["ar"][i].value("name","")); }
+            for(size_t i=0;i<s["ar"].size();++i){ if(i) arts+=L"/"; arts+=Utf8ToWide(JStr(s["ar"][i], "name")); }
             out.artist=arts;
         }
-        if(s.contains("al")){
-            out.album=Utf8ToWide(s["al"].value("name",""));
-            if(s["al"].contains("picUrl")) out.coverUrl=Utf8ToWide(s["al"].value("picUrl",""));
+        if(s.contains("al") && s["al"].is_object()){
+            out.album=Utf8ToWide(JStr(s["al"], "name"));
+            out.coverUrl=Utf8ToWide(JStr(s["al"], "picUrl"));
         }
         return true;
     } catch(...){ return false; }
 }
-bool NcmClient::GetLyric(long long id, std::string& outLrc){
+bool NcmClient::GetLyric(long long id, std::string& outLrc, bool* noLyric){
+    // noLyric: 服务端明确答复"这首歌没有歌词"(纯音乐/无版权/未收录),
+    //          与网络失败区分开, 让调用方能采用不同长度的负缓存 TTL。
+    if(noLyric) *noLyric = false;
     // lv=原词 tv=翻译 kv=老式逐字(klyric) yv=新版逐字(yrc);
     // 逐字歌词需要显式请求才会返回(参考 AIMPLyricsSaver)
-    json j; j["id"]=id; j["lv"]=1; j["tv"]=1; j["kv"]=1; j["yv"]=1;
-    std::string resp;
-    if(cfg_.useProxy && !cfg_.apiUrl.empty()) resp = RequestMirror(L"/lyric", j.dump());
-    else resp = RequestDirect(L"/api/song/lyric", j.dump());
+    //
+    // lv 语义(实测): lv=1 只取"最新版本"歌词, 部分曲目该层为空(如 1935918285
+    // 原词只在旧版本里), 此时返回的 lrc 是空串而 tlyric 完整, 合并后会只剩中文翻译。
+    // lv=-1 表示取全部版本, 可覆盖这类曲目; 但个别曲目 -1 也可能为空,
+    // 因此先用 -1, 拿不到原词再回退 lv=1, 两者都空才判定为"无歌词"。
+    auto fetchLyric = [&](int lv)->std::string{
+        json j; j["id"]=id; j["lv"]=lv; j["tv"]=1; j["kv"]=1; j["yv"]=1;
+        if(cfg_.useProxy && !cfg_.apiUrl.empty()) return RequestMirror(L"/lyric", j.dump());
+        return RequestDirect(L"/api/song/lyric", j.dump());
+    };
+    std::string resp = fetchLyric(-1);
     {   // 排查用日志: 响应体大小(0 说明接口没返回内容)
         char b[160];
-        sprintf_s(b, "lyric tid=%lld resp-size=%zu", (long long)id, resp.size());
+        sprintf_s(b, "lyric tid=%lld lv=-1 resp-size=%zu", (long long)id, resp.size());
         FsLog(b);
     }
     try{
         auto js=json::parse(resp);
         auto lyricOf = [&](const char* key)->std::string{
-            return js.contains(key) ? js[key].value("lyric","") : "";
+            // 歌词字段同样可能是 null(纯音乐/无版权), 必须类型安全取值
+            if(!js.contains(key) || !js[key].is_object()) return "";
+            return JStr(js[key], "lyric");
         };
+        // lv=-1 拿不到任何原词/逐字歌词时回退 lv=1(个别曲目相反: 只有最新版本有词)
+        if(lyricOf("yrc").empty() && lyricOf("klyric").empty() && lyricOf("lrc").empty()){
+            std::string retry = fetchLyric(1);
+            try{
+                auto js2 = json::parse(retry);
+                bool has = false;
+                for(const char* k : {"yrc","klyric","lrc"}){
+                    if(js2.contains(k) && js2[k].is_object() && !JStr(js2[k], "lyric").empty()){ has = true; break; }
+                }
+                if(has){
+                    js = js2;
+                    char b[160];
+                    sprintf_s(b, "lyric tid=%lld lv=-1 had no text, fell back to lv=1 (size=%zu)",
+                              (long long)id, retry.size());
+                    FsLog(b);
+                }
+            }catch(...){ /* 回退响应不可解析: 保持 lv=-1 结果 */ }
+        }
         // 1) 新版逐字 yrc → A2 增强 LRC(行戳 + <字戳>)
         std::string yrc = lyricOf("yrc");
         if(!yrc.empty()){
@@ -672,6 +772,8 @@ bool NcmClient::GetLyric(long long id, std::string& outLrc){
             sprintf_s(b, "lyric: source=lrc+tlyric orig=%zu trans=%zu", orig.size(), trans.size());
             FsLog(b);
         }
+        // 响应是合法 JSON 但没有任何歌词内容 → 服务端明确"无歌词"
+        if(outLrc.empty() && noLyric) *noLyric = true;
         return true;
     } catch(...){
         FsLog("lyric: JSON parse FAILED (接口响应非 JSON, 可能被风控/网络异常)");

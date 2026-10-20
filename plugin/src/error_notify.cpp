@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: MIT
 #include "error_notify.h"
 #include "aimp_task.h"
+#include "config.h"
+#include "utils.h"
 #include "../third_party/aimp_sdk/apiGUI.h"
 #include "../third_party/aimp_sdk/apiObjects.h"
 #include <atomic>
 #include <map>
 #include <mutex>
 #include <string>
+
+void FsLog(const char* what);   // 定义于 filesystem.cpp
 
 namespace {
 
@@ -30,6 +34,9 @@ std::wstring Describe(int code){
 }
 
 // AIMP 皮肤消息框(必须主线程调用)
+// 注意: MB_ICONWARNING/MB_ICONERROR 等图标标志会触发 Windows 系统提示音,
+// 在播放场景下非常刺耳。这里统一用 MB_ICONINFORMATION(Windows 对信息级图标
+// 默认不发声), 保持视觉提示但不播放提示音。
 void ShowAimpMessage(IAIMPCore* core, const std::wstring& caption, const std::wstring& text){
     IAIMPServiceUI* uiSvc = nullptr;
     if(FAILED(core->QueryInterface(IID_IAIMPServiceUI, (void**)&uiSvc)) || !uiSvc) return;
@@ -41,7 +48,7 @@ void ShowAimpMessage(IAIMPCore* core, const std::wstring& caption, const std::ws
         core->CreateObject(IID_IAIMPString, (void**)&txt);
         if(cap) cap->SetData((TChar*)caption.c_str(), (int)caption.size());
         if(txt) txt->SetData((TChar*)text.c_str(), (int)text.size());
-        dlg->Execute(0, cap, txt, MB_OK | MB_ICONWARNING);
+        dlg->Execute(0, cap, txt, MB_OK | MB_ICONINFORMATION);
         if(cap) cap->Release();
         if(txt) txt->Release();
         dlg->Release();
@@ -73,8 +80,23 @@ void NcmErrorNotifyAccess(int httpStatus){
     });
 }
 
+// 读取当前失败提示策略(dialog/silent/off); 配置读取失败时回落到弹窗
+std::wstring FailNotifyMode(){
+    NcmConfig cfg;
+    if(!ConfigManager::Load(cfg)) return L"dialog";
+    if(cfg.failNotify == L"silent" || cfg.failNotify == L"off") return cfg.failNotify;
+    return L"dialog";
+}
+
 void NcmErrorNotifyTrackUnavailable(long long tid, const std::wstring& title, const std::wstring& details){
     if(tid <= 0) return;
+    // 策略先于冷却判断: 用户选择静默时不应占用冷却名额, 也不做任何 UI 操作
+    const std::wstring mode = FailNotifyMode();
+    if(mode != L"dialog"){
+        FsLog(("track-unavailable tid=" + std::to_string(tid) +
+               " suppressed by failNotify=" + WideToUtf8(mode)).c_str());
+        return;
+    }
     ULONGLONG now = GetTickCount64();
     {
         std::lock_guard<std::mutex> lk(g_trackMtx);
@@ -91,7 +113,8 @@ void NcmErrorNotifyTrackUnavailable(long long tid, const std::wstring& title, co
     std::wstring msg = L"AIMP NCM：歌曲「" + title + L"」无法播放。\n\n";
     if(!details.empty()) msg += L"失败记录：\n" + details + L"\n";
     msg += L"多次尝试仍无法获取播放流，此曲可能受音质/版权/网络限制。\n"
-           L"建议：切换音质、检查网络或镜像后重试。";
+           L"建议：切换音质、检查网络或镜像后重试。\n\n"
+           L"（可在 设置 → 插件 → 网易云串流 → 播放失败提示 中关闭此类提醒）";
     ExecuteInMainThread(core, [core, msg]{
         ShowAimpMessage(core, L"AIMP NCM · 曲目不可用", msg);
     });

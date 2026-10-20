@@ -644,9 +644,11 @@ void HandleClientInner(SOCKET s){
     for(int i=0;i<8;i++){ if(cfgA == kLevels[i]){ startIdx = i; break; } }
     std::string url, type, reason, usedLevel;
     std::wstring resolveDetails;   // 取链阶段失败记录
+    bool transportFatal = false;   // 网络/接口不可达(与"该曲无版权"区分, 避免误导用户)
     for(int i=startIdx; i<8; ++i){
         reason.clear();
-        if(client.GetSongUrlLevel(tid, kLevels[i], url, type, &reason) && !url.empty()){
+        bool fatal = false;
+        if(client.GetSongUrlLevel(tid, kLevels[i], url, type, &reason, &fatal) && !url.empty()){
             usedLevel = kLevels[i];
             break;
         }
@@ -655,14 +657,30 @@ void HandleClientInner(SOCKET s){
         FsLog(b);
         resolveDetails += L"  " + Utf8ToWide(kLevels[i]) + L"：" + Utf8ToWide(reason) + L"\n";
         url.clear();
+        // 请求层失败(网络不可达/空响应/非 JSON): 换下一个音质只会重复同一个失败请求,
+        // 直接结束阶梯。此前一首歌会被放大成 5 次请求(实测 2550/2685 均属此类)。
+        if(fatal){
+            transportFatal = true;
+            FsLog(("resolve tid=" + std::to_string(tid) +
+                   " abort level-ladder on transport failure").c_str());
+            resolveDetails += L"  （网络/接口不可达，已停止音质降级）\n";
+            break;
+        }
     }
     if(url.empty()){
-        // 全部音质都取不到链: 明确告知用户此首不可用(每首 30s 冷却, 防连续失败刷屏)
         NcmSong song;
         std::wstring title;
         if(NcmMeta::LookupByTid(tid, song) && !song.title.empty()) title = song.title;
         else title = L"tid " + std::to_wstring(tid);
-        NcmErrorNotifyTrackUnavailable(tid, title, resolveDetails);
+        if(transportFatal){
+            // 网络整体不可用: 逐曲弹"此曲不可用"既是误报又会刷屏, 只记日志。
+            // 播放失败本身由 AIMP 呈现, 网络恢复后下次播放自动恢复。
+            FsLog(("resolve tid=" + std::to_string(tid) +
+                   " skipped track-unavailable popup (transport failure)").c_str());
+        } else {
+            // 全部音质都取不到链: 明确告知用户此首不可用(每首 30s 冷却, 防连续失败刷屏)
+            NcmErrorNotifyTrackUnavailable(tid, title, resolveDetails);
+        }
         SendAll(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return;
     }
