@@ -1,5 +1,7 @@
 # AIMP NCM · 网易云音乐串流插件
 
+**中文** | [English](README.en.md)
+
 > **AIMPack 插件**（AIMP 5.x，x86 + x64）：在 AIMP 中直接播放你的网易云音乐歌单。
 > 支持 Cookie 登录、八档音质切换、歌单一键同步；播放时本地代理把真实音频流交给 AIMP，
 > 并在流内注入完整歌曲信息（标题 / 歌手 / 专辑 / 封面 / 可选歌词），音频落盘缓存、支持拖动进度。
@@ -8,6 +10,7 @@
 ![Version](https://img.shields.io/github/v/release/cirtuslab/AIMP-NCM?label=version&color=blue)
 ![License](https://img.shields.io/github/license/cirtuslab/AIMP-NCM)
 ![AIMP](https://img.shields.io/badge/AIMP-5%2B-orange)
+![Build](https://github.com/cirtuslab/AIMP-NCM/actions/workflows/windows-build.yml/badge.svg)
 
 ## 功能特性
 
