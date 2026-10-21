@@ -1,0 +1,79 @@
+name: Windows build
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build x64 + x86 and package .aimppack
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        shell: pwsh
+        run: |
+          cmake --version
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          } else {
+            Write-Host "vswhere not found"
+          }
+
+      - name: Build (x64 + x86) and package
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File build.ps1
+
+      - name: Verify artifacts
+        shell: pwsh
+        run: |
+          $required = @(
+            'dist/aimp_ncm.aimppack',
+            'dist/aimp_ncm.dll',
+            'dist/x86/aimp_ncm.dll'
+          )
+          $failed = $false
+          foreach ($f in $required) {
+            if (-not (Test-Path $f)) {
+              Write-Host "::error file=$f::missing build artifact"
+              $failed = $true
+              continue
+            }
+            $item = Get-Item $f
+            if ($item.Length -lt 4096) {
+              Write-Host "::error file=$f::suspiciously small ($($item.Length) bytes)"
+              $failed = $true
+            }
+            if ($f -like '*.dll') {
+              $magic = [System.IO.File]::ReadAllBytes($f)[0..1]
+              if ($magic[0] -ne 0x4D -or $magic[1] -ne 0x5A) {
+                Write-Host "::error file=$f::not a PE image (missing MZ header)"
+                $failed = $true
+              }
+            }
+            Write-Host ("{0,-28} {1,10:N0} bytes" -f $f, $item.Length)
+          }
+          if ($failed) { exit 1 }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aimp_ncm-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            dist/aimp_ncm.aimppack
+            dist/aimp_ncm.dll
+            dist/x86/aimp_ncm.dll
+            dist/README_INSTALL.txt
+          if-no-files-found: error
+          retention-days: 30
