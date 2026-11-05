@@ -56,9 +56,16 @@ HRESULT AimpNcmPlugin::Initialize(IAIMPCore* Core){
         NcmConfig cfg; ConfigManager::Load(cfg);
         int bound = 0;
         if(LocalServer::Start(cfg.localPort > 0 ? cfg.localPort : 47777, &bound)){
-            char b[96]; sprintf_s(b, "LocalServer listening on 127.0.0.1:%d", bound);
+            const bool external = LocalServer::IsExternal();
+            char b[128];
+            if(external)
+                sprintf_s(b, "LocalServer: reusing existing instance on 127.0.0.1:%d", bound);
+            else
+                sprintf_s(b, "LocalServer listening on 127.0.0.1:%d", bound);
             FsLog(b);
-            if(bound != cfg.localPort){ cfg.localPort = bound; ConfigManager::Save(cfg); }
+            if(!external && bound != cfg.localPort){
+                cfg.localPort = bound; ConfigManager::Save(cfg);
+            }
         } else {
             FsLog("LocalServer start FAILED");
         }

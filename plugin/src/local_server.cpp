@@ -36,7 +36,11 @@ std::mutex g_connMtx;                      // B2: 连接表
 std::set<SOCKET> g_conns;
 std::condition_variable g_connCv;
 int g_boundPort = 0;
+bool g_external = false;                   // 端口由另一个 AIMP 实例的本地服务占用并复用
+bool g_wsaOwned = false;                   // 本实例是否持有 WSAStartup 引用(Stop 时配对释放)
 const DWORD kConnStopWaitMs = 30000;       // B2: 卸载等待连接线程兜底上限
+const int kMaxPortTries = 20;              // 端口被占用时最多向后尝试的个数
+const DWORD kProbeTimeoutMs = 700;         // 复用探测: 建连+响应总超时
 
 void ConnAdd(SOCKET c){
     std::lock_guard<std::mutex> lk(g_connMtx);
@@ -135,6 +139,63 @@ bool SendAll(SOCKET s, const char* data, int len){
     return true;
 }
 bool SendAll(SOCKET s, const std::string& data){ return SendAll(s, data.c_str(), (int)data.size()); }
+
+// 探测指定回环端口上是否已经有同一插件的可用本地服务。
+// 仅当端口被另一个 AIMP 实例占用时调用: 建连/读响应都有短超时, 任何失败
+// (拒绝/超时/非 200/缺少魔数)都视为不可复用, 调用方继续尝试下一个端口。
+// 注意: 必须使用非阻塞 connect, 否则残留监听套接字(SYN 被丢弃)会让启动卡住。
+bool ProbeExistingServer(int port, const std::string& token){
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if(s == INVALID_SOCKET) return false;
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((u_short)port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    bool connected = false;
+    u_long nonBlocking = 1;
+    if(ioctlsocket(s, FIONBIO, &nonBlocking) == 0){
+        int rc = connect(s, (sockaddr*)&addr, sizeof(addr));
+        if(rc == 0){
+            connected = true;
+        } else if(WSAGetLastError() == WSAEWOULDBLOCK){
+            fd_set wf;
+            FD_ZERO(&wf);
+            FD_SET(s, &wf);
+            timeval tv{};
+            tv.tv_sec = (long)(kProbeTimeoutMs / 1000);
+            tv.tv_usec = (long)((kProbeTimeoutMs % 1000) * 1000);
+            if(select(0, nullptr, &wf, nullptr, &tv) > 0){
+                int err = 0, len = sizeof(err);
+                if(getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&err, &len) == 0 && err == 0)
+                    connected = true;
+            }
+        }
+        nonBlocking = 0;
+        ioctlsocket(s, FIONBIO, &nonBlocking);
+    }
+
+    bool ok = false;
+    if(connected){
+        DWORD tmo = kProbeTimeoutMs;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof(tmo));
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tmo, sizeof(tmo));
+        std::string req = "GET /health/" + token +
+                          " HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+        if(SendAll(s, req)){
+            char buf[256] = {0};
+            int n = recv(s, buf, (int)sizeof(buf) - 1, 0);
+            if(n > 0){
+                std::string resp(buf, (size_t)n);
+                ok = resp.find(" 200 ") != std::string::npos &&
+                     resp.find("aimp_ncm_ok") != std::string::npos;
+            }
+        }
+    }
+    closesocket(s);
+    return ok;
+}
 
 long long ParseRangeStart(const std::string& req);
 
@@ -595,6 +656,29 @@ void HandleClientInner(SOCKET s){
         return;
     }
 
+    // 存活探测(仅供本机另一个 AIMP 实例决定是否复用本服务):
+    //   GET /health/{localToken}
+    // 不访问网络/缓存, 也不返回任何配置内容; token 不匹配一律 403。
+    {
+        const std::string kHealthPrefix = "/health/";
+        if(path.rfind(kHealthPrefix, 0) == 0){
+            NcmConfig cfg; ConfigManager::Load(cfg);
+            std::string tok = path.substr(kHealthPrefix.size());
+            size_t q = tok.find('?');
+            if(q != std::string::npos) tok.resize(q);
+            if(!cfg.localToken.empty() && SecureEquals(tok, WideToUtf8(cfg.localToken))){
+                const std::string body = "aimp_ncm_ok";
+                SendAll(s, "HTTP/1.1 200 OK\r\n"
+                           "Content-Type: text/plain\r\n"
+                           "Content-Length: " + std::to_string(body.size()) + "\r\n"
+                           "Connection: close\r\n\r\n" + body);
+            } else {
+                SendAll(s, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+            return;
+        }
+    }
+
     // 鉴权: 未设置 token 时放行(兼容旧版播放列表条目); 否则路径必须带正确 token 段
     if(!AuthTokenOk(path)){
         SendAll(s, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -758,11 +842,17 @@ void RunCleanupNow(){
     CleanupOldCache();
 }
 
+bool IsExternal(){
+    std::lock_guard<std::mutex> lk(g_srvMtx);
+    return g_external;
+}
+
 bool Start(int preferredPort, int* boundPort){
     std::lock_guard<std::mutex> lk(g_srvMtx);   // B3: Start/Stop 互斥
-    if(g_run){ if(boundPort) *boundPort = g_boundPort; return true; }
+    if(g_run || g_external){ if(boundPort) *boundPort = g_boundPort; return true; }
     // 本地代理 token: 首次启动时自动生成并持久化(防止本机其他进程借用代理)。
     // CSPRNG 失败时拒绝启动, 绝不在空 token 下监听。
+    std::string token;
     {
         NcmConfig cfg; ConfigManager::Load(cfg);
         if(cfg.localToken.empty()){
@@ -776,43 +866,110 @@ bool Start(int preferredPort, int* boundPort){
             }
             ConfigManager::Save(cfg);
         }
+        token = WideToUtf8(cfg.localToken);
     }
     WSADATA wsa;
     if(WSAStartup(MAKEWORD(2,2), &wsa) != 0) return false;
-    g_listen = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if(g_listen == INVALID_SOCKET){ WSACleanup(); return false; }
 
-    BOOL reuse = TRUE;
-    setsockopt(g_listen, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+    const int basePort = preferredPort > 0 ? preferredPort : 47777;
+    for(int i = 0; i < kMaxPortTries; ++i){
+        const int port = basePort + i;
+        if(port <= 0 || port > 65535) break;
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // loopback only
+        // 每个候选端口独立建 socket: 失败后不复用, 避免残留状态影响下一次 bind。
+        SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if(s == INVALID_SOCKET) continue;
 
-    int port = preferredPort > 0 ? preferredPort : 47777;
-    bool ok = false;
-    for(int i = 0; i < 20; ++i){
-        addr.sin_port = htons((u_short)(port + i));
-        if(bind(g_listen, (sockaddr*)&addr, sizeof(addr)) == 0){
-            ok = true; port = port + i; break;
+        // 关键修复: Windows 下 SO_REUSEADDR 允许多个进程 bind 同一端口, 且连接
+        // 会被丢进"无人 accept"的监听队列(表现为 AIMP 报 Can't open the file,
+        // 插件日志里连 GetFileAttrs 都没有)。SO_EXCLUSIVEADDRUSE 保证同一端口
+        // 只有一个监听者, 被占用时 bind 返回 WSAEADDRINUSE, 从而真正触发换端口。
+        // 已验证: 该选项仍允许重启后在 TIME_WAIT/FIN_WAIT_2 残留连接上重新监听。
+        BOOL exclusive = TRUE;
+        if(setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                      (const char*)&exclusive, sizeof(exclusive)) != 0){
+            closesocket(s);
+            continue;
         }
-    }
-    if(!ok || listen(g_listen, 8) != 0){
-        closesocket(g_listen); g_listen = INVALID_SOCKET; WSACleanup();
-        return false;
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // loopback only
+        addr.sin_port = htons((u_short)port);
+
+        if(bind(s, (sockaddr*)&addr, sizeof(addr)) != 0){
+            const int err = WSAGetLastError();
+            closesocket(s);
+            // 端口被另一个 AIMP 实例占用时, 先确认对方是"可用的同插件服务":
+            // 可用则复用它(多开 AIMP 共用一份服务器, 播放列表端口保持不变);
+            // 残留/无响应的监听者(僵尸进程)探测必然失败, 继续换下一个端口。
+            if(err == WSAEADDRINUSE && ProbeExistingServer(port, token)){
+                g_external = true;
+                g_boundPort = port;
+                g_wsaOwned = false;
+                WSACleanup();
+                char b[128];
+                sprintf_s(b, "LocalServer: reusing existing instance on 127.0.0.1:%d", port);
+                FsLog(b);
+                if(boundPort) *boundPort = port;
+                return true;
+            }
+            char b[112];
+            sprintf_s(b, "LocalServer: port %d unavailable (wsa=%d), trying next", port, err);
+            FsLog(b);
+            continue;
+        }
+
+        if(listen(s, 8) != 0){
+            closesocket(s);
+            FsLog("LocalServer: listen FAILED, trying next port");
+            continue;
+        }
+
+        g_listen = s;
+        g_boundPort = port;
+        g_run = true;
+        g_external = false;
+        g_wsaOwned = true;
+        try{
+            g_acceptThread = std::thread(AcceptLoop);
+        }catch(...){
+            // 线程创建失败: 回滚监听状态, 否则后续 Start 会误以为服务已在运行
+            g_run = false;
+            closesocket(g_listen);
+            g_listen = INVALID_SOCKET;
+            g_boundPort = 0;
+            g_wsaOwned = false;
+            WSACleanup();
+            FsLog("LocalServer start FAILED: cannot create accept thread");
+            return false;
+        }
+        // 放到线程启动之后: 即使清理缓存抛异常, 服务本身也已处于可用的自洽状态
+        CleanupOldCache();
+        if(port != basePort){
+            char b[176];
+            sprintf_s(b, "LocalServer: preferred port %d busy, using %d "
+                         "(re-sync playlist if URLs still point to %d)",
+                      basePort, port, basePort);
+            FsLog(b);
+        }
+        if(boundPort) *boundPort = port;
+        return true;
     }
 
-    CleanupOldCache();
-
-    g_boundPort = port;
-    g_run = true;
-    g_acceptThread = std::thread(AcceptLoop);
-    if(boundPort) *boundPort = port;
-    return true;
+    WSACleanup();
+    FsLog("LocalServer start FAILED: no free loopback port");
+    return false;
 }
 
 void Stop(){
     std::lock_guard<std::mutex> lk(g_srvMtx);   // B3: Start/Stop 互斥
+    // 复用他人服务时本实例没有监听套接字, 直接归还状态(不能 WSACleanup 别人的引用)
+    if(g_external){
+        g_external = false;
+        g_boundPort = 0;
+        return;
+    }
     g_run = false;
     if(g_listen != INVALID_SOCKET){
         closesocket(g_listen);      // unblock accept()
@@ -821,7 +978,7 @@ void Stop(){
     if(g_acceptThread.joinable()) g_acceptThread.join();
     ConnShutdownAll();                          // B2: 通知连接线程退出
     ConnWaitEmpty(kConnStopWaitMs);             // B2: 等待(兜底 30s)后再清理 Winsock
-    WSACleanup();
+    if(g_wsaOwned){ WSACleanup(); g_wsaOwned = false; }
 }
 
 } // namespace LocalServer
