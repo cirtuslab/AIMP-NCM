@@ -23,7 +23,7 @@ std::wstring ConfigManager::GetConfigDir() {
     WCHAR path[MAX_PATH] = {0};
     SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, path);
     std::wstring dir = std::wstring(path) + L"\\AIMP\\NcmPlugin";
-    CreateDirectoryW(dir.c_str(), nullptr);
+    SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
     return dir;
 }
 
@@ -240,4 +240,22 @@ bool ConfigManager::UpdateDeviceCookie(const std::wstring& deviceCookie) {
     NcmConfig cfg; LoadLocked(cfg);
     cfg.deviceCookie = deviceCookie;
     return SaveLocked(cfg);
+}
+bool ConfigManager::UpdateLocalPort(int port) {
+    std::lock_guard<std::mutex> lk(g_cfgMtx);
+    NcmConfig cfg; LoadLocked(cfg);
+    cfg.localPort = port;
+    return SaveLocked(cfg);
+}
+bool ConfigManager::EnsureLocalToken(std::wstring& outToken, const std::function<bool(std::wstring&)>& generator) {
+    std::lock_guard<std::mutex> lk(g_cfgMtx);
+    NcmConfig cfg; LoadLocked(cfg);
+    if (cfg.localToken.empty()) {
+        std::wstring generated;
+        if (!generator || !generator(generated) || generated.empty()) return false;
+        cfg.localToken = generated;
+        if (!SaveLocked(cfg)) return false;
+    }
+    outToken = cfg.localToken;
+    return !outToken.empty();
 }

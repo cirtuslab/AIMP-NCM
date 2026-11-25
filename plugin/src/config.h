@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #pragma once
+#include <functional>
 #include <string>
 #include <vector>
 #include <windows.h>
@@ -37,4 +38,7 @@ public:
     //     避免用旧快照整份回写、覆盖用户并发保存的其它设置。
     static bool UpdateUid(const std::wstring& uid);
     static bool UpdateDeviceCookie(const std::wstring& deviceCookie);
+    // H-4: 字段级更新 localPort / 原子初始化 localToken, 防止旧快照覆盖已生成的代理凭据
+    static bool UpdateLocalPort(int port);
+    static bool EnsureLocalToken(std::wstring& outToken, const std::function<bool(std::wstring&)>& generator);
 };
