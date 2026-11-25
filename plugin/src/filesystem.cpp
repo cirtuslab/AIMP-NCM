@@ -3,6 +3,7 @@
 #include "utils.h"
 #include "config.h"
 #include "meta_cache.h"
+#include "security_utils.h"
 #include "../third_party/aimp_sdk/apiFileManager.h"
 #include <shlwapi.h>
 #include <fstream>
@@ -18,24 +19,9 @@ std::mutex g_logMtx;
 const ULONGLONG kLogMaxBytes = 3ull * 1024 * 1024;
 const ULONGLONG kLogKeepMs   = 7ull * 24 * 3600 * 1000;
 
-// 把串中所有敏感键值替换为 <redacted>
+// 把串中所有敏感键值及 /x/<token>/ 路径段替换为 <redacted>
 std::string RedactSecret(const std::string& s){
-    std::string out = s;
-    const char* keys[] = {"MUSIC_U=", "cookie=", "X-NCM-Token:", "localToken", "mirrorToken"};
-    for(const char* k : keys){
-        size_t pos = 0;
-        while((pos = out.find(k, pos)) != std::string::npos){
-            // 值起点: 跳过键后的空白(如 "X-NCM-Token: xxx")
-            size_t v = pos + strlen(k);
-            while(v < out.size() && (out[v] == ' ' || out[v] == '\t')) ++v;
-            // 值到行尾/分号/空白为止
-            size_t end = out.find_first_of(";\r\n \"", v);
-            if(end == std::string::npos) end = out.size();
-            out.replace(v, end - v, "<redacted>");
-            pos = v + 10;
-        }
-    }
-    return out;
+    return NcmSec::RedactSensitiveText(s);
 }
 }
 void FsLog(const char* what){
@@ -320,7 +306,7 @@ bool NcmFileSystem::ParseStreamUri(const std::wstring& uri, long long& pid, long
     std::wstring rest = uri.substr(hostEnd + 1);
     // 去掉可选的 x/{token}/ 前缀(不校验 token 值, 仅解析; 鉴权由本地代理执行)
     if(rest.rfind(L"x/", 0) == 0){
-        size_t slash = rest.find(L'/');
+        size_t slash = rest.find(L'/', 2);
         if(slash != std::wstring::npos) rest = rest.substr(slash + 1);
         else return false;
     }

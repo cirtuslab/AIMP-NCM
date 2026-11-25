@@ -58,7 +58,8 @@ HRESULT AimpNcmPlugin::Initialize(IAIMPCore* Core){
         if(LocalServer::Start(cfg.localPort > 0 ? cfg.localPort : 47777, &bound)){
             char b[96]; sprintf_s(b, "LocalServer listening on 127.0.0.1:%d", bound);
             FsLog(b);
-            if(bound != cfg.localPort){ cfg.localPort = bound; ConfigManager::Save(cfg); }
+            // H-4: 字段级更新端口, 避免用 Start() 前加载的旧快照覆盖新生成的 localToken
+            if(bound != cfg.localPort){ ConfigManager::UpdateLocalPort(bound); }
         } else {
             FsLog("LocalServer start FAILED");
         }

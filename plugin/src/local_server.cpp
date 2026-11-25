@@ -9,6 +9,7 @@
 #include "utils.h"
 #include "meta_cache.h"
 #include "error_notify.h"
+#include "security_utils.h"
 #include <winhttp.h>
 #include <atomic>
 #include <chrono>
@@ -35,6 +36,8 @@ std::mutex g_srvMtx;                       // B3: 保护 Start/Stop 与 g_listen
 std::mutex g_connMtx;                      // B2: 连接表
 std::set<SOCKET> g_conns;
 std::condition_variable g_connCv;
+std::mutex g_tokenMtx;                     // H-4: 保护内存缓存的本地代理 Token
+std::string g_localToken;
 int g_boundPort = 0;
 const DWORD kConnStopWaitMs = 30000;       // B2: 卸载等待连接线程兜底上限
 
@@ -136,8 +139,6 @@ bool SendAll(SOCKET s, const char* data, int len){
 }
 bool SendAll(SOCKET s, const std::string& data){ return SendAll(s, data.c_str(), (int)data.size()); }
 
-long long ParseRangeStart(const std::string& req);
-
 // serve a local file directly (supports Range); returns whether handled.
 // tag: 可选 ID3v2 前缀标签, 使虚拟流 = tag + 音频(客户端偏移需减去 tagSize 映射到文件)
 // H2: 本函数与 ProxyAndCache 一律不关闭连接 socket, 统一由 HandleClient 的 RAII 收尾,
@@ -149,8 +150,8 @@ bool ServeFile(SOCKET s, const std::wstring& path, const std::wstring& ext, long
     if(!GetFileSizeEx(f, &li)){ CloseHandle(f); return false; }
     long long tagSize = tag ? (long long)tag->size() : 0;
     long long size = li.QuadPart + tagSize;              // 虚拟流总长 = 标签 + 原音频
-    if(reqStart >= size){
-        // A7: 越界 Range → 416, 而不是当作未命中重新拉流
+    if(reqStart < 0 || reqStart >= size){
+        // A7 + H-2: 负数或越界 Range → 416, 绝不允许负偏移参与 tag->data() 指针运算
         std::string head = "HTTP/1.1 416 Range Not Satisfiable\r\n"
                            "Content-Range: bytes */" + std::to_string(size) + "\r\n"
                            "Content-Length: 0\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n";
@@ -229,9 +230,12 @@ void HttpClose(HttpGet& g){
 }
 
 // 发起一次 GET 并返回响应; 自动跟随 302/301/303/307/308 重定向(最多 5 跳);
-// TLS 默认严格校验; 仅配置的镜像 host 证书异常时放宽重试一次
+// TLS 默认严格校验; 仅配置的镜像 host 证书异常时放宽重试一次;
+// H-5: 禁用 WinHTTP 自动重定向, 每一跳均校验非回环/内网主机(显式配置的镜像 host 除外)防止 SSRF
 bool HttpOpenGet(const std::wstring& url, HttpGet& g, int* outStatus = nullptr){
     if(outStatus) *outStatus = 0;
+    NcmConfig tlsCfg;
+    ConfigManager::Load(tlsCfg);
     std::wstring current = url;
     for(int hop = 0; hop < 6; ++hop){
         URL_COMPONENTS uc = {}; uc.dwStructSize = sizeof(uc);
@@ -242,6 +246,13 @@ bool HttpOpenGet(const std::wstring& url, HttpGet& g, int* outStatus = nullptr){
             HttpClose(g);   // 确保不泄漏本跳已打开的句柄
             return false;
         }
+        bool schemeOk = (uc.nScheme == INTERNET_SCHEME_HTTP || uc.nScheme == INTERNET_SCHEME_HTTPS);
+        bool isConfiguredMirror = tlsCfg.useProxy && HostAllowsTlsRelax(uc.lpszHostName, tlsCfg.apiUrl);
+        if(!schemeOk || (!isConfiguredMirror && !NcmSec::IsSafeExternalHost(uc.lpszHostName))){
+            FsLog("HttpOpenGet: blocked unsafe or non-public URL");
+            HttpClose(g);
+            return false;
+        }
 
         g.ses = WinHttpOpen(L"AIMP-NCM/1.5", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                             WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -250,14 +261,13 @@ bool HttpOpenGet(const std::wstring& url, HttpGet& g, int* outStatus = nullptr){
         WinHttpSetOption(g.ses, WINHTTP_OPTION_CONNECT_TIMEOUT, &t, sizeof(t));
         WinHttpSetOption(g.ses, WINHTTP_OPTION_RECEIVE_TIMEOUT, &t, sizeof(t));
         WinHttpSetOption(g.ses, WINHTTP_OPTION_RESOLVE_TIMEOUT, &t, sizeof(t));
+        WinHttpSetOption(g.ses, WINHTTP_OPTION_SEND_TIMEOUT, &t, sizeof(t));
 
         g.con = WinHttpConnect(g.ses, uc.lpszHostName, uc.nPort, 0);
         if(!g.con){ HttpClose(g); return false; }
         bool https = uc.nScheme == INTERNET_SCHEME_HTTPS;
         // M2: 默认严格 TLS; 仅用户配置的镜像 host 允许证书放宽一次。
         //     CDN/网易云域名禁止降级，避免被中间人替换音频或截获后续跳转。
-        NcmConfig tlsCfg;
-        ConfigManager::Load(tlsCfg);
         const bool allowRelax = https && HostAllowsTlsRelax(uc.lpszHostName, tlsCfg.apiUrl);
         const int maxRelax = allowRelax ? 1 : 0;
         bool reqOk = false;
@@ -266,6 +276,9 @@ bool HttpOpenGet(const std::wstring& url, HttpGet& g, int* outStatus = nullptr){
                                        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
                                        https ? WINHTTP_FLAG_SECURE : 0);
             if(!g.req) break;
+            // H-5: 禁用 WinHTTP 内部自动重定向, 由外层循环逐跳执行 SSRF 主机校验
+            DWORD redirPolicy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+            WinHttpSetOption(g.req, WINHTTP_OPTION_REDIRECT_POLICY, &redirPolicy, sizeof(redirPolicy));
             if(relax){
                 FsLog("HttpOpenGet: mirror TLS cert check failed, retry once with relaxed flags");
                 DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
@@ -319,12 +332,16 @@ bool HttpOpenGet(const std::wstring& url, HttpGet& g, int* outStatus = nullptr){
         if(!WinHttpQueryHeaders(g.req, WINHTTP_QUERY_LOCATION, nullptr, loc, &locLen, nullptr)){
             HttpClose(g); return false;
         }
-        // Location 可能是相对路径: 补全为绝对 URL 再进入下一跳
+        // Location 可能是相对路径: 补全为绝对 URL 再进入下一跳(保留非默认端口)
         std::wstring next(loc);
         if(!next.empty() && next.rfind(L"//", 0) == 0){
             next = (https ? L"https:" : L"http:") + next;   // 协议相对: //host/path
         } else if(!next.empty() && next[0] == L'/'){
-            next = (https ? L"https://" : L"http://") + std::wstring(host) + next;
+            bool defaultPort = (https && uc.nPort == 443) || (!https && uc.nPort == 80);
+            std::wstring hostPort = defaultPort
+                ? std::wstring(host)
+                : (std::wstring(host) + L":" + std::to_wstring(uc.nPort));
+            next = (https ? L"https://" : L"http://") + hostPort + next;
         } else if(next.find(L"://") == std::wstring::npos){
             size_t q = current.find(L'?');
             std::wstring base = q == std::wstring::npos ? current : current.substr(0, q);
@@ -355,6 +372,13 @@ int HttpRead(HttpGet& g, char* buf, int len){
 int ProxyAndCache(SOCKET s, long long pid, long long tid, const std::wstring& url,
                   const std::wstring& ext, long long reqStart, const std::string* tag,
                   std::string* failReason = nullptr){
+    // H-1: 纵深防御, 再次规范化扩展名, 杜绝任何路径分隔符或遍历段进入落盘路径
+    const std::wstring safeExt = NcmSec::SanitizeAudioExt(ext);
+    if(reqStart < 0){
+        SendAll(s, "HTTP/1.1 416 Range Not Satisfiable\r\n"
+                   "Content-Length: 0\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n");
+        return 1;
+    }
     HttpGet g;
     int cdnStatus = 0;
     if(!HttpOpenGet(url, g, &cdnStatus)){
@@ -398,18 +422,18 @@ int ProxyAndCache(SOCKET s, long long pid, long long tid, const std::wstring& ur
     std::string prefix(probeBuf, probeGot);
     bool magicOk = true;
     if(!prefix.empty()){
-        std::string e = WideToUtf8(ext);
+        std::string e = WideToUtf8(safeExt);
         unsigned char b0 = (unsigned char)prefix[0];
         if(e == "flac")      magicOk = prefix.compare(0, 4, "fLaC") == 0;
         else if(e == "wav")  magicOk = prefix.compare(0, 4, "RIFF") == 0;
         else if(e == "m4a")  magicOk = prefix.size() >= 8 && prefix.compare(4, 4, "ftyp") == 0;
         // mp3/aac: MPEG 同步 0xFFE 或 ADTS(AAC) 同步 0xFFF, 或 ID3 前缀
-        else                 magicOk = (b0 == 0xFF && ((unsigned char)prefix[1] & 0xE0) == 0xE0) ||
+        else                 magicOk = (prefix.size() >= 2 && b0 == 0xFF && ((unsigned char)prefix[1] & 0xE0) == 0xE0) ||
                                        prefix.compare(0, 3, "ID3") == 0;
     }
     if(badCtype || !magicOk){
         if(failReason) *failReason = "内容校验失败 (Content-Type: " + ct + ")";
-        FsLog(("content check FAIL ct=" + ct + " ext=" + WideToUtf8(ext) +
+        FsLog(("content check FAIL ct=" + ct + " ext=" + WideToUtf8(safeExt) +
                " magicOk=" + (magicOk ? "1" : "0")).c_str());
         HttpClose(g);
         return 0;       // 触发上层重试(最多3次), 全部失败后提示"此曲不可用"
@@ -424,7 +448,7 @@ int ProxyAndCache(SOCKET s, long long pid, long long tid, const std::wstring& ur
         head = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(virtualTotal) + "\r\n";
     else
         head = "HTTP/1.1 200 OK\r\n";
-    head += "Accept-Ranges: bytes\r\nContent-Type: " + WideToUtf8(MimeFor(ext)) +
+    head += "Accept-Ranges: bytes\r\nContent-Type: " + WideToUtf8(MimeFor(safeExt)) +
             "\r\nConnection: close\r\n\r\n";
     if(!SendAll(s, head)){
         // H2: 客户端尚未收到任何响应字节就断开 → 返回"连接已死",
@@ -491,7 +515,7 @@ int ProxyAndCache(SOCKET s, long long pid, long long tid, const std::wstring& ur
     bool complete = !dlError && (total < 0 || pos >= total);
     if(complete && pos > 0){
         if(cf.is_open()) cf.close();
-        std::wstring finalPath = CacheDir() + L"\\" + std::to_wstring(pid) + L"_" + std::to_wstring(tid) + L"." + ext;
+        std::wstring finalPath = CacheDir() + L"\\" + std::to_wstring(pid) + L"_" + std::to_wstring(tid) + L"." + safeExt;
         // D4: 原子替换, 避免并发读者看到缺失/半截文件
         if(MoveFileExW(partPath.c_str(), finalPath.c_str(),
                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
@@ -503,18 +527,6 @@ int ProxyAndCache(SOCKET s, long long pid, long long tid, const std::wstring& ur
         DeleteFileW(partPath.c_str()); // incomplete download: no cache
     }
     return 1;   // H2: 连接由 HandleClient 的 RAII 统一关闭
-}
-
-long long ParseRangeStart(const std::string& req){
-    size_t p = req.find("Range:");
-    if(p == std::string::npos) p = req.find("range:");
-    if(p == std::string::npos) return 0;
-    p = req.find("bytes=", p);
-    if(p == std::string::npos) return 0;
-    p += 6;
-    long long v = 0;
-    while(p < req.size() && isdigit((unsigned char)req[p])){ v = v*10 + (req[p]-'0'); ++p; }
-    return v;
 }
 
 // H2: 连接 socket 的 RAII 所有权 —— HandleClient 的所有退出路径(含异常展开)统一
@@ -530,32 +542,23 @@ struct ConnCloser {
     }
 };
 
-// ---- 本地代理鉴权 ----
-// 播放列表条目形如 http://127.0.0.1:{port}/x/{token}/{pid}/{tid}.mp3,
-// token 段用于防止本机其他进程(恶意网页/文档)直接借用代理拉流。
-// 校验失败统一返回 403, 不泄露任何内部信息。
-// 空 token 一律拒绝(不再放行): Start() 首次启动会自动生成; 老播放列表需重新「应用」同步。
-bool AuthTokenOk(const std::string& path){
-    NcmConfig cfg; ConfigManager::Load(cfg);
-    if(cfg.localToken.empty()) return false;
-    // 期望路径: /x/{token}/{pid}/{tid}
+// ---- H-4: 本地代理鉴权(内存态 Fail-Closed + 常量时间比较) ----
+// 播放列表条目形如 http://127.0.0.1:{port}/x/{token}/{pid}/{tid},
+// token 在 LocalServer::Start 时原子确保生成并驻留内存, 避免每请求重复读盘。
+bool AuthAndStripTokenPath(const std::string& path, std::string& out){
+    std::string expected;
+    {
+        std::lock_guard<std::mutex> lk(g_tokenMtx);
+        expected = g_localToken;
+    }
+    if(expected.empty()) return false;
     const std::string kPrefix = "/x/";
     if(path.rfind(kPrefix, 0) != 0) return false;
     std::string rest = path.substr(kPrefix.size());
     size_t slash = rest.find('/');
-    if(slash == std::string::npos) return false;
+    if(slash == std::string::npos || slash == 0) return false;
     std::string tok = rest.substr(0, slash);
-    return SecureEquals(tok, WideToUtf8(cfg.localToken));
-}
-// 去掉路径中的 token 段, 得到 /{pid}/{tid} 形式
-bool StripTokenPath(const std::string& path, std::string& out){
-    NcmConfig cfg; ConfigManager::Load(cfg);
-    if(cfg.localToken.empty()) return false;
-    const std::string kPrefix = "/x/";
-    if(path.rfind(kPrefix, 0) != 0) return false;
-    std::string rest = path.substr(kPrefix.size());
-    size_t slash = rest.find('/');
-    if(slash == std::string::npos) return false;
+    if(!NcmSec::ConstantTimeEqual(tok, expected)) return false;
     out = "/" + rest.substr(slash + 1);
     return true;
 }
@@ -595,12 +598,8 @@ void HandleClientInner(SOCKET s){
         return;
     }
 
-    // 鉴权: 未设置 token 时放行(兼容旧版播放列表条目); 否则路径必须带正确 token 段
-    if(!AuthTokenOk(path)){
-        SendAll(s, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        return;
-    }
-    if(!StripTokenPath(path, path)){
+    // H-4: 严格鉴权(Fail-Closed), 校验并剥离 /x/{token} 段
+    if(!AuthAndStripTokenPath(path, path)){
         SendAll(s, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return;
     }
@@ -623,7 +622,12 @@ void HandleClientInner(SOCKET s){
         SendAll(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return;
     }
-    long long rangeStart = ParseRangeStart(req);
+    long long rangeStart = 0;
+    if(!NcmSec::ParseRangeStartSafe(req, rangeStart) || rangeStart < 0){
+        SendAll(s, "HTTP/1.1 416 Range Not Satisfiable\r\n"
+                   "Content-Length: 0\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n");
+        return;
+    }
 
     // 构建 ID3v2 流标签(标题/歌手/专辑/时长/封面) — 由 NcmMeta 从元数据缓存生成,
     // 使 AIMP 从音频流中解析出歌曲信息(网络流不经 FileInfoProvider 回调)
@@ -684,8 +688,8 @@ void HandleClientInner(SOCKET s){
         SendAll(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return;
     }
-    std::wstring ext = Utf8ToWide(type.empty() ? "mp3" : type);
-    std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+    // H-1: 音频扩展名严格白名单校验, 阻止恶意 type 触发路径遍历写任意文件
+    std::wstring ext = NcmSec::SanitizeAudioExt(Utf8ToWide(type));
 
     // 3) 拉流: 下载失败不做降级, 同一链接后台重试最多 3 次,
     //    3 次均失败则提示用户"此首不可用"并返回 404
@@ -761,29 +765,34 @@ void RunCleanupNow(){
 bool Start(int preferredPort, int* boundPort){
     std::lock_guard<std::mutex> lk(g_srvMtx);   // B3: Start/Stop 互斥
     if(g_run){ if(boundPort) *boundPort = g_boundPort; return true; }
-    // 本地代理 token: 首次启动时自动生成并持久化(防止本机其他进程借用代理)。
-    // CSPRNG 失败时拒绝启动, 绝不在空 token 下监听。
+    // H-4: 本地代理 token 原子生成并驻留内存; CSPRNG 失败时拒绝启动, 绝不在空 token 下监听。
     {
-        NcmConfig cfg; ConfigManager::Load(cfg);
-        if(cfg.localToken.empty()){
-            for(int i = 0; i < 4 && cfg.localToken.empty(); ++i){
+        std::wstring tokW;
+        bool tokOk = ConfigManager::EnsureLocalToken(tokW, [](std::wstring& out) {
+            for(int i = 0; i < 4; ++i){
                 std::string rnd = NcmCrypto::RandomString(24);
-                if(rnd.size() >= 24) cfg.localToken = Utf8ToWide(rnd);
+                if(rnd.size() >= 24){
+                    out = Utf8ToWide(rnd);
+                    return true;
+                }
             }
-            if(cfg.localToken.empty()){
-                FsLog("LocalServer start FAILED: cannot generate localToken (CSPRNG)");
-                return false;
-            }
-            ConfigManager::Save(cfg);
+            return false;
+        });
+        if(!tokOk || tokW.empty()){
+            FsLog("LocalServer start FAILED: cannot initialize localToken (CSPRNG/config)");
+            return false;
         }
+        std::lock_guard<std::mutex> tlk(g_tokenMtx);
+        g_localToken = WideToUtf8(tokW);
     }
     WSADATA wsa;
     if(WSAStartup(MAKEWORD(2,2), &wsa) != 0) return false;
     g_listen = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if(g_listen == INVALID_SOCKET){ WSACleanup(); return false; }
 
-    BOOL reuse = TRUE;
-    setsockopt(g_listen, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+    // H-4: Windows 下使用 SO_EXCLUSIVEADDRUSE 取代 SO_REUSEADDR, 防止本机其他进程绑定同端口劫持流量
+    BOOL exclusive = TRUE;
+    setsockopt(g_listen, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&exclusive, sizeof(exclusive));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;

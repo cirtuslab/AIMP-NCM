@@ -8,6 +8,7 @@
 //  - 不发送 CORS 头, 浏览器页面无法跨域借用本服务
 //  - 可选共享 Token: 设置环境变量 NCM_MIRROR_TOKEN 后, 所有请求必须带
 //    X-NCM-Token 头(插件「镜像 Token」设置项), 否则 403
+const crypto = require('crypto')
 const express = require('express')
 const cookieParser = require('cookie-parser')
 
@@ -19,31 +20,52 @@ const TOKEN = process.env.NCM_MIRROR_TOKEN || ''
 // 恒定时间比较, 降低时序侧信道
 function tokenEquals(a, b){
   if(typeof a !== 'string' || typeof b !== 'string') return false
-  if(a.length !== b.length) return false
-  let diff = 0
-  for(let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
-  return diff === 0
+  const ba = Buffer.from(a, 'utf8')
+  const bb = Buffer.from(b, 'utf8')
+  if(ba.length !== bb.length) return false
+  return crypto.timingSafeEqual(ba, bb)
 }
 
 const app = express()
-app.use(express.json())
-app.use(express.urlencoded({extended:true}))
+app.use(express.json({ limit: '128kb' }))
+app.use(express.urlencoded({ extended: false, limit: '128kb' }))
 app.use(cookieParser())
 
 // M5: 不提供通配 CORS —— 本镜像按设计只服务本机插件(WinHTTP 客户端, 不受 CORS 约束),
 //     开放跨域会让任意网页(含 DNS rebinding)把本机当作访问网易云的匿名中转
 
-// 路径白名单: 只暴露插件用到的接口
-const ALLOWED = new Set([
-  'login/qr/key',
-  'login/qr/check',
-  'user/playlist',
-  'playlist/track/all',
-  'song/url/v1',
-  'song/detail',
-  'lyric',
-  'user/account',
-])
+// 路径与参数白名单: 只暴露插件用到的接口及明确允许的业务参数,
+// 禁止透传 proxy / realIP / crypto / ua 等 NeteaseCloudMusicApi 内部控制字段(防 SSRF / 选项注入)
+const ALLOWED_PARAMS = Object.assign(Object.create(null), {
+  'login/qr/key': ['cookie'],
+  'login/qr/check': ['key', 'cookie'],
+  'user/playlist': ['uid', 'limit', 'offset', 'includeVideo', 'cookie'],
+  'playlist/track/all': ['id', 'limit', 'offset', 'cookie'],
+  'song/url/v1': ['id', 'level', 'encodeType', 'cookie'],
+  'song/detail': ['ids', 'c', 'cookie'],
+  'lyric': ['id', 'lv', 'tv', 'kv', 'yv', 'cookie'],
+  'user/account': ['cookie'],
+})
+
+function pickAllowedParams(route, rawQuery, rawBody){
+  const keys = ALLOWED_PARAMS[route]
+  if(!keys) return null
+  const merged = Object.assign(Object.create(null), rawQuery || {}, rawBody || {})
+  const safe = {}
+  for(const k of keys){
+    if(!Object.prototype.hasOwnProperty.call(merged, k)) continue
+    const v = merged[k]
+    if(v === undefined || v === null) continue
+    if(typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean'){
+      safe[k] = v
+    }
+  }
+  // cookie 特殊处理:
+  // 注意: express 的 query/body 解析已完成一次 URL 解码, 这里不能再 decodeURIComponent,
+  // 否则 cookie 值中的 %XX 序列会被二次解码破坏(新版 MUSIC_U 较长, 风险更高)
+  if(safe.cookie !== undefined) safe.cookie = String(safe.cookie)
+  return safe
+}
 
 // 鉴权中间件: Token 校验(可选) + 路径白名单
 app.all('*', (req, res, next)=>{
@@ -51,7 +73,8 @@ app.all('*', (req, res, next)=>{
     const got = req.get('X-NCM-Token') || ''
     if(!tokenEquals(got, TOKEN)) return res.status(403).json({code:403, msg:'forbidden: bad or missing X-NCM-Token'})
   }
-  if(!ALLOWED.has(req.path.replace(/^\//,''))){
+  const route = req.path.replace(/^\//,'')
+  if(!Object.prototype.hasOwnProperty.call(ALLOWED_PARAMS, route)){
     return res.status(404).json({code:404, msg:'module not found'})
   }
   next()
@@ -60,12 +83,8 @@ app.all('*', (req, res, next)=>{
 // 通用转发： /song/url/v1 (POST: id/level/cookie 走 body)
 app.all('*', async (req,res)=>{
   const url = req.path.replace(/^\//,'') // e.g. song/url/v1
-  // 将查询参数合并
-  const query = {...req.query, ...req.body}
-  // cookie 特殊处理
-  // 注意: express 的 query 解析已完成一次 URL 解码, 这里不能再 decodeURIComponent,
-  // 否则 cookie 值中的 %XX 序列会被二次解码破坏(新版 MUSIC_U 较长, 风险更高)
-  if(query.cookie) { query.cookie = String(query.cookie) }
+  const query = pickAllowedParams(url, req.query, req.body)
+  if(!query) return res.status(404).json({code:404, msg:'module not found'})
   // 映射表
   const map = {
     'login/qr/key': 'login_qr_key',
@@ -77,9 +96,9 @@ app.all('*', async (req,res)=>{
     'lyric': 'lyric',
     'user/account': 'user_account',
   }
-  const modName = map[url] || url.replace(/\//g,'_')
-  const fn = api[modName]
-  if(!fn) return res.status(404).json({code:404, msg:'module not found: '+modName})
+  const modName = map[url]
+  const fn = modName && api[modName]
+  if(!fn) return res.status(404).json({code:404, msg:'module not found'})
   try{
     const result = await fn(query)
     // result.cookie 可能为数组
@@ -87,7 +106,7 @@ app.all('*', async (req,res)=>{
     res.json(result.body || result)
   }catch(e){
     console.error(e)
-    res.status(500).json({code:500, msg: e.message})
+    res.status(500).json({code:500, msg: 'internal server error'})
   }
 })
 

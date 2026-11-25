@@ -3,6 +3,7 @@
 #include "config.h"
 #include "utils.h"
 #include "error_notify.h"
+#include "security_utils.h"
 #include <cstring>
 #include <fstream>
 #include <winhttp.h>
@@ -63,34 +64,50 @@ void WriteFileAll(const std::wstring& path, const std::string& bytes){
 }
 
 // WinHTTP GET -> 内存字节
+// H-5: 禁用自动重定向并逐跳校验外部主机(配置镜像 host 除外)防 SSRF + HTTP 200 校验 + 16MB 体积上限防 OOM
 bool HttpDownloadBytes(const std::wstring& url, std::string& out){
-    URL_COMPONENTS uc = {}; uc.dwStructSize = sizeof(uc);
-    WCHAR host[256] = {0}, path[2048] = {0};
-    uc.lpszHostName = host; uc.dwHostNameLength = 256;
-    uc.lpszUrlPath  = path; uc.dwUrlPathLength  = 2048;
-    if(!WinHttpCrackUrl(url.c_str(), (DWORD)url.size(), 0, &uc)) return false;
+    const size_t kMaxCoverBytes = 16u * 1024u * 1024u;
+    out.clear();
+    NcmConfig tlsCfg;
+    ConfigManager::Load(tlsCfg);
+    std::wstring current = url;
+    for(int hop = 0; hop < 6; ++hop){
+        URL_COMPONENTS uc = {}; uc.dwStructSize = sizeof(uc);
+        WCHAR host[256] = {0}, path[2048] = {0};
+        uc.lpszHostName = host; uc.dwHostNameLength = 256;
+        uc.lpszUrlPath  = path; uc.dwUrlPathLength  = 2048;
+        if(!WinHttpCrackUrl(current.c_str(), (DWORD)current.size(), 0, &uc)) return false;
 
-    HINTERNET ses = WinHttpOpen(L"AIMP-NCM/1.5", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if(!ses) return false;
-    DWORD t = 10000;
-    WinHttpSetOption(ses, WINHTTP_OPTION_CONNECT_TIMEOUT, &t, sizeof(t));
-    WinHttpSetOption(ses, WINHTTP_OPTION_RECEIVE_TIMEOUT, &t, sizeof(t));
-    HINTERNET con = WinHttpConnect(ses, uc.lpszHostName, uc.nPort, 0);
-    HINTERNET req = nullptr;
-    bool ok = false;
-    if(con){
+        bool schemeOk = (uc.nScheme == INTERNET_SCHEME_HTTP || uc.nScheme == INTERNET_SCHEME_HTTPS);
+        bool isConfiguredMirror = tlsCfg.useProxy && HostAllowsTlsRelax(uc.lpszHostName, tlsCfg.apiUrl);
+        if(!schemeOk || (!isConfiguredMirror && !NcmSec::IsSafeExternalHost(uc.lpszHostName))){
+            FsLog("HttpDownloadBytes: blocked unsafe or non-public URL");
+            return false;
+        }
+
+        HINTERNET ses = WinHttpOpen(L"AIMP-NCM/1.5", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if(!ses) return false;
+        DWORD t = 10000;
+        WinHttpSetOption(ses, WINHTTP_OPTION_CONNECT_TIMEOUT, &t, sizeof(t));
+        WinHttpSetOption(ses, WINHTTP_OPTION_RECEIVE_TIMEOUT, &t, sizeof(t));
+        WinHttpSetOption(ses, WINHTTP_OPTION_RESOLVE_TIMEOUT, &t, sizeof(t));
+        WinHttpSetOption(ses, WINHTTP_OPTION_SEND_TIMEOUT, &t, sizeof(t));
+        HINTERNET con = WinHttpConnect(ses, uc.lpszHostName, uc.nPort, 0);
+        if(!con){ WinHttpCloseHandle(ses); return false; }
+
         bool https = uc.nScheme == INTERNET_SCHEME_HTTPS;
         // M2: 默认严格 TLS; 仅用户配置的镜像 host 允许证书放宽一次(封面/歌词下载)
-        NcmConfig tlsCfg;
-        ConfigManager::Load(tlsCfg);
         const bool allowRelax = https && HostAllowsTlsRelax(uc.lpszHostName, tlsCfg.apiUrl);
         const int maxRelax = allowRelax ? 1 : 0;
+        HINTERNET req = nullptr;
         for(int relax = 0; relax <= maxRelax; ++relax){
             req = WinHttpOpenRequest(con, L"GET", uc.lpszUrlPath, nullptr,
                                      WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
                                      https ? WINHTTP_FLAG_SECURE : 0);
             if(!req) break;
+            DWORD redirPolicy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+            WinHttpSetOption(req, WINHTTP_OPTION_REDIRECT_POLICY, &redirPolicy, sizeof(redirPolicy));
             if(relax){
                 FsLog("HttpDownloadBytes: mirror TLS cert check failed, retry once with relaxed flags");
                 DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
@@ -108,29 +125,74 @@ bool HttpDownloadBytes(const std::wstring& url, std::string& out){
                            err == ERROR_WINHTTP_SECURE_CERT_DATE_INVALID ||
                            err == ERROR_WINHTTP_SECURE_INVALID_CA ||
                            err == ERROR_WINHTTP_SECURE_INVALID_CERT);
-            // 仅镜像允许第二次(放宽)尝试; 非 TLS 或已用尽次数则结束
             if(!tlsErr || relax >= maxRelax) break;
         }
-        if(req){
-            DWORD status = 0, statusLen = sizeof(status);
-            if(WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                                   nullptr, &status, &statusLen, nullptr))
-                NcmErrorNotifyAccess((int)status);
-            for(;;){
-                DWORD avail = 0;
-                if(!WinHttpQueryDataAvailable(req, &avail) || avail == 0) { ok = true; break; }
-                size_t before = out.size();
-                out.resize(before + avail);
-                DWORD got = 0;
-                if(!WinHttpReadData(req, out.data() + before, avail, &got)){ ok = false; break; }
-                out.resize(before + got);
+        if(!req){ WinHttpCloseHandle(con); WinHttpCloseHandle(ses); return false; }
+
+        DWORD status = 0, statusLen = sizeof(status);
+        WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            nullptr, &status, &statusLen, nullptr);
+        bool redirect = (status == 301 || status == 302 || status == 303 ||
+                         status == 307 || status == 308);
+        if(redirect){
+            if(hop == 5){ WinHttpCloseHandle(req); WinHttpCloseHandle(con); WinHttpCloseHandle(ses); return false; }
+            WCHAR loc[2048] = {0}; DWORD locLen = sizeof(loc);
+            bool hasLoc = WinHttpQueryHeaders(req, WINHTTP_QUERY_LOCATION, nullptr, loc, &locLen, nullptr) != 0;
+            WinHttpCloseHandle(req); WinHttpCloseHandle(con); WinHttpCloseHandle(ses);
+            if(!hasLoc) return false;
+            std::wstring next(loc);
+            if(!next.empty() && next.rfind(L"//", 0) == 0){
+                next = (https ? L"https:" : L"http:") + next;
+            } else if(!next.empty() && next[0] == L'/'){
+                bool defaultPort = (https && uc.nPort == 443) || (!https && uc.nPort == 80);
+                std::wstring hostPort = defaultPort
+                    ? std::wstring(host)
+                    : (std::wstring(host) + L":" + std::to_wstring(uc.nPort));
+                next = (https ? L"https://" : L"http://") + hostPort + next;
+            } else if(next.find(L"://") == std::wstring::npos){
+                size_t q = current.find(L'?');
+                std::wstring base = q == std::wstring::npos ? current : current.substr(0, q);
+                size_t slash = base.find_last_of(L'/');
+                next = (slash == std::wstring::npos ? current : base.substr(0, slash + 1)) + next;
             }
-            WinHttpCloseHandle(req);
+            current = next;
+            continue;
         }
+
+        if(status != 200){
+            NcmErrorNotifyAccess((int)status);
+            WinHttpCloseHandle(req); WinHttpCloseHandle(con); WinHttpCloseHandle(ses);
+            return false;
+        }
+
+        DWORD cl = 0, clLen = sizeof(cl);
+        if(WinHttpQueryHeaders(req, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+                               nullptr, &cl, &clLen, nullptr) && cl > kMaxCoverBytes){
+            FsLog("HttpDownloadBytes: response Content-Length exceeds limit");
+            WinHttpCloseHandle(req); WinHttpCloseHandle(con); WinHttpCloseHandle(ses);
+            return false;
+        }
+
+        bool ok = false;
+        for(;;){
+            DWORD avail = 0;
+            if(!WinHttpQueryDataAvailable(req, &avail) || avail == 0){ ok = true; break; }
+            if(out.size() + avail > kMaxCoverBytes){
+                FsLog("HttpDownloadBytes: response body exceeds limit");
+                out.clear(); ok = false; break;
+            }
+            size_t before = out.size();
+            out.resize(before + avail);
+            DWORD got = 0;
+            if(!WinHttpReadData(req, out.data() + before, avail, &got)){ out.clear(); ok = false; break; }
+            out.resize(before + got);
+        }
+        WinHttpCloseHandle(req);
         WinHttpCloseHandle(con);
+        WinHttpCloseHandle(ses);
+        return ok && !out.empty();
     }
-    WinHttpCloseHandle(ses);
-    return ok && !out.empty();
+    return false;
 }
 
 // 网易云 al.picUrl 可能是协议相对地址 (//p1.music.126.net/...)，下载前补全
